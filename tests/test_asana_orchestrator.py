@@ -48,6 +48,7 @@ def make_config(tmp_path: Path, *, timeout: int | None = None) -> orchestrator.O
         objective_verifier=True,
         keep_worktrees=False,
         stage_timeout_seconds=timeout,
+        stage_environment={},
     )
 
 
@@ -122,6 +123,50 @@ print("hello from stage")
             self.assertTrue(outcome.report_path.exists())
             self.assertTrue(outcome.log_path.exists())
             self.assertIn(str(outcome.log_path), outcome.report["artifact_paths"])
+
+    def test_stage_runner_passes_configured_stage_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            writer = tmp_path / "writer.py"
+            writer.write_text(
+                """
+import json
+import os
+
+report = {
+    "task_id": os.environ["ORCHESTRATOR_TASK_ID"],
+    "status": "success",
+    "summary": os.environ["PRODUCTION_HOST"],
+    "changed_files": [],
+    "checks": [{"name": "deploy target", "status": "passed"}],
+    "failures": [],
+    "next_action": "continue",
+    "artifact_paths": [],
+}
+with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                stage_environment={"PRODUCTION_HOST": "prod.example.com"},
+            )
+            runner = orchestrator.StageRunner(config)
+            outcome = runner.run(
+                stage="deployer",
+                command=f'"{sys.executable}" "{writer}"',
+                task_contract={"gid": "123", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            self.assertTrue(outcome.succeeded)
+            self.assertEqual(outcome.summary, "prod.example.com")
 
     def test_stage_runner_synthesizes_failure_when_report_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +634,38 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.provider_name, "asana")
             self.assertEqual(config.retry_limit, 2)
             self.assertFalse(config.deploy_enabled)
+
+    def test_config_from_env_collects_stage_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            env = {
+                "ASANA_ACCESS_TOKEN": "token",
+                "ASANA_PROJECT_GID": "project",
+                "ASANA_SECTION_READY_GID": "ready",
+                "ASANA_SECTION_BUILDING_GID": "building",
+                "ASANA_SECTION_VERIFYING_GID": "verifying",
+                "ASANA_SECTION_FAILED_GID": "failed",
+                "ASANA_SECTION_DEPLOYING_GID": "deploying",
+                "ASANA_SECTION_DONE_GID": "done",
+                "ASANA_SECTION_BLOCKED_GID": "blocked",
+                "ORCHESTRATOR_BUILDER_COMMAND": "build",
+                "ORCHESTRATOR_VERIFIER_COMMAND": "verify",
+                "ORCHESTRATOR_DEPLOY_HOST": "prod.example.com",
+                "ORCHESTRATOR_DEPLOY_USER": "deploy",
+                "ORCHESTRATOR_STAGE_ENV_KEYS": "PRODUCTION_HOST",
+                "PRODUCTION_HOST": "app.example.com",
+                "ORCHESTRATOR_STAGE_ENV_DEPLOY_PORT": "22",
+            }
+
+            config = orchestrator.OrchestratorConfig.from_env(env, cwd=repo)
+
+            self.assertEqual(config.stage_environment["ORCHESTRATOR_DEPLOY_HOST"], "prod.example.com")
+            self.assertEqual(config.stage_environment["ORCHESTRATOR_DEPLOY_USER"], "deploy")
+            self.assertEqual(config.stage_environment["PRODUCTION_HOST"], "app.example.com")
+            self.assertEqual(config.stage_environment["DEPLOY_PORT"], "22")
+            self.assertNotIn("ASANA_ACCESS_TOKEN", config.stage_environment)
 
     def test_validate_runtime_config_rejects_missing_stage_script(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

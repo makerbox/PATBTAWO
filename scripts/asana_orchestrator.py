@@ -61,6 +61,15 @@ STAGE_COMMAND_PATH_EXTENSIONS = {
     ".yml",
 }
 SHELL_CONTROL_TOKENS = {"&&", "||", "|", ";", "(", ")"}
+STAGE_ENV_PREFIXES = ("ORCHESTRATOR_STAGE_ENV_", "PATBTAWO_STAGE_ENV_")
+STAGE_ENV_KEY_LIST = "ORCHESTRATOR_STAGE_ENV_KEYS"
+DEPLOY_ENV_PREFIXES = ("ORCHESTRATOR_DEPLOY_", "ORCHESTRATOR_SMOKE_")
+RESERVED_DEPLOY_ENV_KEYS = {
+    "ORCHESTRATOR_DEPLOY_COMMAND",
+    "ORCHESTRATOR_DEPLOY_ENABLED",
+    "ORCHESTRATOR_DEPLOYER_AGENT_COMMAND",
+    "ORCHESTRATOR_SMOKE_COMMAND",
+}
 
 
 class ConfigError(RuntimeError):
@@ -218,6 +227,7 @@ class OrchestratorConfig:
     objective_verifier: bool
     keep_worktrees: bool
     stage_timeout_seconds: Optional[int]
+    stage_environment: Dict[str, str]
 
     @classmethod
     def from_env(
@@ -291,6 +301,7 @@ class OrchestratorConfig:
             objective_verifier=not falsey(environ.get("ORCHESTRATOR_OBJECTIVE_VERIFIER")),
             keep_worktrees=truthy(environ.get("ORCHESTRATOR_KEEP_WORKTREES")),
             stage_timeout_seconds=stage_timeout,
+            stage_environment=stage_environment_from_env(environ),
         )
 
     def deploy_stage_command(self) -> Optional[str]:
@@ -304,6 +315,7 @@ class OrchestratorConfig:
     def redacted_dict(self) -> Dict[str, Any]:
         payload = dataclasses.asdict(self)
         payload["provider_options"] = redact_secrets(self.provider_options)
+        payload["stage_environment"] = redact_secrets(self.stage_environment)
         for key in ("repo_root", "worktree_root", "artifact_root"):
             payload[key] = str(payload[key])
         return payload
@@ -372,6 +384,38 @@ def first_env(environ: Mapping[str, str], names: Sequence[str], *, required: boo
     if required:
         raise MissingConfigError("Missing required configuration: " + " or ".join(names))
     return ""
+
+
+def split_env_key_list(value: str) -> List[str]:
+    keys: List[str] = []
+    for part in re.split(r"[,\s]+", value):
+        key = part.strip()
+        if key:
+            keys.append(key)
+    return keys
+
+
+def stage_environment_from_env(environ: Mapping[str, str]) -> Dict[str, str]:
+    stage_env: Dict[str, str] = {}
+
+    for key in split_env_key_list(environ.get(STAGE_ENV_KEY_LIST, "")):
+        if key in environ:
+            stage_env[key] = environ[key]
+
+    for key, value in environ.items():
+        if key == STAGE_ENV_KEY_LIST:
+            continue
+        for prefix in STAGE_ENV_PREFIXES:
+            if key.startswith(prefix):
+                target = key.removeprefix(prefix)
+                if target:
+                    stage_env[target] = value
+                break
+        else:
+            if key.startswith(DEPLOY_ENV_PREFIXES) and key not in RESERVED_DEPLOY_ENV_KEYS:
+                stage_env[key] = value
+
+    return stage_env
 
 
 def command_tokens(command: str) -> List[str]:
@@ -1604,6 +1648,7 @@ class StageRunner:
         task_id = str(task_contract["gid"])
         subagent_id = f"{slug(task_id)}-{attempt}-{slug(stage)}-{compact_timestamp()}"
         env = os.environ.copy()
+        env.update(self.config.stage_environment)
         env.update(
             {
                 "ORCHESTRATOR_STAGE": stage,

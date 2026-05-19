@@ -142,6 +142,38 @@ Deploy runs only when enabled or when a deploy/smoke command is set. If both
 deploy and smoke commands are set, they run as one deployer stage joined with
 `&&`; the stage must still write one deployer report.
 
+PATBTAWO does not infer where production is. Configure a deployer command and
+pass the target details as environment variables:
+
+```sh
+ORCHESTRATOR_DEPLOY_ENABLED=true
+ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python scripts/deploy.py
+ORCHESTRATOR_SMOKE_COMMAND=python scripts/smoke.py
+ORCHESTRATOR_DEPLOY_HOST=prod.example.com
+ORCHESTRATOR_DEPLOY_USER=deploy
+ORCHESTRATOR_DEPLOY_PATH=/srv/app
+ORCHESTRATOR_DEPLOY_SSH_KEY_PATH=~/.ssh/patbtawo_deploy
+```
+
+`ORCHESTRATOR_DEPLOY_*` values, except PATBTAWO's own deploy command/enabled
+settings, are passed to builder/verifier/deployer stage commands from `.env`.
+For arbitrary variables, either list existing names in
+`ORCHESTRATOR_STAGE_ENV_KEYS`:
+
+```sh
+ORCHESTRATOR_STAGE_ENV_KEYS=PRODUCTION_HOST,DEPLOY_REGION
+PRODUCTION_HOST=prod.example.com
+DEPLOY_REGION=us-east-1
+```
+
+or expose them with `ORCHESTRATOR_STAGE_ENV_`:
+
+```sh
+ORCHESTRATOR_STAGE_ENV_PRODUCTION_HOST=prod.example.com
+```
+
+which passes `PRODUCTION_HOST=prod.example.com` to stage commands.
+
 The `*_AGENT_COMMAND` variables are plain shell commands. They may launch Codex,
 Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other executable
 workflow. The orchestrator starts a fresh subprocess for each stage and passes a

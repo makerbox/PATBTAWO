@@ -69,6 +69,10 @@ Before starting a real board run, make sure the builder and verifier commands in
 commands must write JSON to `ORCHESTRATOR_REPORT_PATH`; validation catches
 obvious missing local paths before tasks are moved.
 
+Deployment is opt-in. Set `ORCHESTRATOR_DEPLOY_ENABLED=true`, provide
+`ORCHESTRATOR_DEPLOYER_AGENT_COMMAND` or `ORCHESTRATOR_DEPLOY_COMMAND`, and pass
+target details such as `ORCHESTRATOR_DEPLOY_HOST` through `.env`.
+
 Configuration and provider setup are documented in
 [docs/task-orchestrator.md](docs/task-orchestrator.md), with a starter
 environment file in [.env.example](.env.example).
