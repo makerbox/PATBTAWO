@@ -528,9 +528,34 @@ def validate_runtime_config(config: "OrchestratorConfig") -> None:
                 f"(resolved to {path}). Set the stage command to a real agent/script "
                 "that writes JSON to ORCHESTRATOR_REPORT_PATH."
             )
+        if codex_approval_flag_after_exec(command):
+            errors.append(
+                f"{stage} command places --ask-for-approval after 'codex exec'. "
+                "Move it before the subcommand, for example: "
+                "codex --ask-for-approval never exec --sandbox workspace-write ..."
+            )
+
+    for name, command in sorted(config.stage_environment.items()):
+        if name not in PATBTAWO_RUN_COMMAND_KEYS or not command:
+            continue
+        if codex_approval_flag_after_exec(command):
+            errors.append(
+                f"{name} places --ask-for-approval after 'codex exec'. "
+                "Move it before the subcommand, for example: "
+                "codex --ask-for-approval never exec --sandbox workspace-write ..."
+            )
 
     if errors:
         raise ConfigError("Stage command configuration is invalid:\n- " + "\n- ".join(errors))
+
+
+def codex_approval_flag_after_exec(command: str) -> bool:
+    lowered = command.lower()
+    ask_index = lowered.find("--ask-for-approval")
+    if ask_index < 0:
+        return False
+    exec_index = lowered.find(" exec ")
+    return exec_index >= 0 and ask_index > exec_index and "codex" in lowered[:exec_index]
 
 
 def output_tail(output: str, *, max_lines: int = 5, max_chars: int = 500) -> str:

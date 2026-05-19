@@ -123,8 +123,11 @@ PATBTAWO_SMOKE_RUN_COMMAND=
 Example builder run command:
 
 ```sh
-PATBTAWO_BUILDER_RUN_COMMAND=codex exec --sandbox workspace-write --ask-for-approval never "Read ORCHESTRATOR_TASK_CONTRACT_PATH, implement the task in this worktree, run relevant checks, and do not commit."
+PATBTAWO_BUILDER_RUN_COMMAND=codex --ask-for-approval never exec --sandbox workspace-write "Read ORCHESTRATOR_TASK_CONTRACT_PATH, implement the task in this worktree, run relevant checks, and do not commit."
 ```
+
+For Codex CLI, keep global CLI flags such as `--ask-for-approval` before the
+`exec` subcommand.
 
 Provider-specific aliases are supported. For example, Asana can use
 `ASANA_SECTION_READY_GID`, Trello can use `TRELLO_LIST_READY_ID`, ClickUp can use

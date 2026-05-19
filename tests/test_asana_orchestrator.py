@@ -851,6 +851,39 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("builder command references missing local path", message)
             self.assertIn("scripts/builder.py", message)
 
+    def test_validate_runtime_config_rejects_misordered_codex_approval_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                stage_environment={
+                    "PATBTAWO_BUILDER_RUN_COMMAND": (
+                        "codex exec --sandbox workspace-write --ask-for-approval never "
+                        "\"Do the task\""
+                    )
+                },
+            )
+
+            with self.assertRaises(orchestrator.ConfigError) as context:
+                orchestrator.validate_runtime_config(config)
+
+            self.assertIn("codex --ask-for-approval never exec", str(context.exception))
+
+    def test_validate_runtime_config_accepts_top_level_codex_approval_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                stage_environment={
+                    "PATBTAWO_BUILDER_RUN_COMMAND": (
+                        "codex --ask-for-approval never exec --sandbox workspace-write "
+                        "\"Do the task\""
+                    )
+                },
+            )
+
+            orchestrator.validate_runtime_config(config)
+
     def test_trello_config_uses_list_state_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
