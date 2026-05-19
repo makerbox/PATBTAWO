@@ -469,7 +469,7 @@ def configuration_help(provider_name: str, error: Exception) -> str:
     elif provider_name == "trello":
         lines.append("Trello requires TRELLO_API_KEY, TRELLO_TOKEN, list IDs, and builder/verifier commands.")
     elif provider_name == "clickup":
-        lines.append("ClickUp requires CLICKUP_ACCESS_TOKEN, CLICKUP_LIST_ID, status names, and builder/verifier commands.")
+        lines.append("ClickUp requires CLICKUP_ACCESS_TOKEN, CLICKUP_LIST_ID, status names or status IDs, and builder/verifier commands.")
     elif provider_name == "jira":
         lines.append("Jira requires JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, Ready query/project config, transitions/statuses, and builder/verifier commands.")
     elif provider_name == "monday":
@@ -758,24 +758,35 @@ class ClickUpProvider:
         self.dry_run = dry_run
         self.api_base = api_base.rstrip("/")
         self.http = HttpJsonClient()
+        self._status_aliases: Optional[Dict[str, str]] = None
 
     @property
     def headers(self) -> Dict[str, str]:
         return {"Authorization": self.access_token}
 
     def get_next_ready_task(self, section_gid: str) -> Optional[Dict[str, Any]]:
-        ready_status = section_gid.strip().lower()
+        ready_values = self._status_match_values(section_gid)
+        status_filter = self._status_api_value(section_gid)
+        if self._looks_like_status_id(section_gid) and status_filter.strip().lower() == section_gid.strip().lower():
+            status_filter = ""
         for page in range(20):
+            params: Dict[str, Any] = {
+                "archived": "false",
+                "include_closed": "true",
+                "subtasks": "true",
+                "page": page,
+            }
+            if status_filter:
+                params["statuses[]"] = [status_filter]
             response = self.http.request(
                 "GET",
                 f"{self.api_base}/list/{self.list_id}/task",
                 headers=self.headers,
-                params={"archived": "false", "include_closed": "true", "page": page},
+                params=params,
             )
             tasks = response.get("tasks") or []
             for task in tasks:
-                status = str((task.get("status") or {}).get("status") or "").strip().lower()
-                if status == ready_status:
+                if self._task_matches_status(task, ready_values):
                     return self._normalize(task)
             if not tasks:
                 return None
@@ -791,14 +802,15 @@ class ClickUpProvider:
         )
 
     def move_task(self, task_gid: str, section_gid: str) -> None:
+        status_value = self._status_api_value(section_gid) or section_gid
         if self.dry_run:
-            print(f"[dry-run] ClickUp move task {task_gid} to status {section_gid}")
+            print(f"[dry-run] ClickUp move task {task_gid} to status {status_value}")
             return
         self.http.request(
             "PUT",
             f"{self.api_base}/task/{task_gid}",
             headers=self.headers,
-            json_body={"status": section_gid},
+            json_body={"status": status_value},
         )
 
     def comment(self, task_gid: str, text: str) -> None:
@@ -811,6 +823,66 @@ class ClickUpProvider:
             headers=self.headers,
             json_body={"comment_text": text},
         )
+
+    def _status_api_value(self, configured_status: str) -> str:
+        configured = configured_status.strip()
+        aliases = self._load_status_aliases()
+        return aliases.get(configured.lower(), configured)
+
+    @staticmethod
+    def _looks_like_status_id(value: str) -> bool:
+        return bool(re.match(r"^p\d+_", value.strip(), flags=re.IGNORECASE))
+
+    def _status_match_values(self, configured_status: str) -> set[str]:
+        configured = configured_status.strip()
+        values = {configured.lower()}
+        resolved = self._status_api_value(configured)
+        if resolved:
+            values.add(resolved.lower())
+        aliases = self._load_status_aliases()
+        for key, value in aliases.items():
+            if key == configured.lower() or value.lower() == configured.lower():
+                values.add(key)
+                values.add(value.lower())
+        return values
+
+    def _load_status_aliases(self) -> Dict[str, str]:
+        if self._status_aliases is not None:
+            return self._status_aliases
+        aliases: Dict[str, str] = {}
+        try:
+            list_payload = self.http.request(
+                "GET",
+                f"{self.api_base}/list/{self.list_id}",
+                headers=self.headers,
+            )
+        except ProviderError:
+            self._status_aliases = aliases
+            return aliases
+        for status in list_payload.get("statuses") or []:
+            if not isinstance(status, Mapping):
+                continue
+            label = str(status.get("status") or status.get("name") or "").strip()
+            if not label:
+                continue
+            aliases[label.lower()] = label
+            for key in ("id", "status_id"):
+                value = str(status.get(key) or "").strip()
+                if value:
+                    aliases[value.lower()] = label
+        self._status_aliases = aliases
+        return aliases
+
+    @staticmethod
+    def _task_matches_status(task: Mapping[str, Any], allowed_values: set[str]) -> bool:
+        status = task.get("status") or {}
+        if not isinstance(status, Mapping):
+            return False
+        for key in ("id", "status_id", "status", "name", "type"):
+            value = str(status.get(key) or "").strip().lower()
+            if value and value in allowed_values:
+                return True
+        return False
 
     @staticmethod
     def _normalize(task: Mapping[str, Any]) -> Dict[str, Any]:

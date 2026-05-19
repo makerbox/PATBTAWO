@@ -189,6 +189,10 @@ CLICKUP_STATUS_DONE=Done
 CLICKUP_STATUS_BLOCKED=Blocked
 ```
 
+ClickUp lifecycle values may be either status names (`Ready`) or status IDs
+(`p901...`). PATBTAWO resolves status IDs through the List metadata before
+filtering tasks or moving tasks.
+
 Jira:
 
 ```sh

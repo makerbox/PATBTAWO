@@ -176,6 +176,68 @@ class CommentFormattingTests(unittest.TestCase):
         self.assertIn("Next: Fix the regression in the parser.", lines)
 
 
+class ClickUpProviderTests(unittest.TestCase):
+    def test_clickup_provider_matches_ready_status_by_id(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def request(self, method, url, **kwargs):
+                self.requests.append((method, url, kwargs))
+                if url.endswith("/list/list-1"):
+                    return {
+                        "statuses": [
+                            {"id": "p123_ready", "status": "Ready"},
+                            {"id": "p123_done", "status": "Done"},
+                        ]
+                    }
+                if url.endswith("/list/list-1/task"):
+                    return {
+                        "tasks": [
+                            {
+                                "id": "task-1",
+                                "name": "Build feature",
+                                "description": "Details",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "url": "https://app.clickup.com/t/task-1",
+                            }
+                        ]
+                    }
+                raise AssertionError(url)
+
+        provider = orchestrator.ClickUpProvider("token", "list-1")
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        task = provider.get_next_ready_task("p123_ready")
+
+        self.assertIsNotNone(task)
+        self.assertEqual(task["gid"], "task-1")
+        task_request = fake_http.requests[-1]
+        self.assertEqual(task_request[2]["params"]["statuses[]"], ["Ready"])
+
+    def test_clickup_provider_resolves_status_id_before_move(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.update_body = None
+
+            def request(self, method, url, **kwargs):
+                if url.endswith("/list/list-1"):
+                    return {"statuses": [{"id": "p123_building", "status": "Building"}]}
+                if url.endswith("/task/task-1"):
+                    self.update_body = kwargs["json_body"]
+                    return {}
+                raise AssertionError(url)
+
+        provider = orchestrator.ClickUpProvider("token", "list-1")
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        provider.move_task("task-1", "p123_building")
+
+        self.assertEqual(fake_http.update_body, {"status": "Building"})
+
+
 class WorktreeIsolationTests(unittest.TestCase):
     def test_checkpoint_can_seed_fresh_verifier_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
