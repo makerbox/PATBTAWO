@@ -1764,9 +1764,10 @@ class TaskOrchestrator:
             task_id = str(task_stub["gid"])
             print(f"Selected Ready task {task_id}: {task_stub.get('name', '')}")
             task_contract = self._contract_for(task_id)
-            self._process_task(task_contract, start_attempt=0)
+            result = self._process_task(task_contract, start_attempt=0)
             if once:
                 return
+            print(f"Task {task_id} finished with {result}; checking Ready for the next task.")
 
     def _resume_active(self, active: Mapping[str, Any]) -> None:
         task_id = str(active.get("task_id") or "")
@@ -1804,7 +1805,7 @@ class TaskOrchestrator:
         *,
         start_attempt: int,
         resumed: bool = False,
-    ) -> None:
+    ) -> str:
         task_id = str(task_contract["gid"])
         max_attempts = self.config.retry_limit + 1
         attempt = start_attempt
@@ -1847,13 +1848,13 @@ class TaskOrchestrator:
             if outcome.succeeded:
                 self.state.clear_active()
                 self.worktrees.remove(worktree_path)
-                return
+                return "success"
             if outcome.blocked:
                 self._move(task_id, "blocked")
                 self._comment_outcome(task_id, outcome, attempt, max_attempts, terminal="blocked")
                 self.state.clear_active()
                 self.worktrees.remove(worktree_path)
-                return
+                return "blocked"
             if outcome.retryable and attempt < max_attempts:
                 self._comment_outcome(task_id, outcome, attempt, max_attempts, terminal="retrying")
                 self.worktrees.remove(worktree_path)
@@ -1863,7 +1864,8 @@ class TaskOrchestrator:
             self._comment_outcome(task_id, outcome, attempt, max_attempts, terminal="failed")
             self.state.clear_active()
             self.worktrees.remove(worktree_path)
-            return
+            return "failed"
+        return "exhausted"
 
     def _append_active_worktree(self, path: Path) -> None:
         state = self.state.load()

@@ -238,6 +238,82 @@ class ClickUpProviderTests(unittest.TestCase):
         self.assertEqual(fake_http.update_body, {"status": "Building"})
 
 
+class OrchestratorQueueTests(unittest.TestCase):
+    def test_run_continues_after_task_failure_when_not_once(self) -> None:
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.ready = [
+                    {"gid": "task-1", "name": "First"},
+                    {"gid": "task-2", "name": "Second"},
+                ]
+                self.moved = []
+                self.comments = []
+
+            def get_next_ready_task(self, section_gid):
+                return self.ready.pop(0) if self.ready else None
+
+            def get_task_contract(self, task_gid):
+                return {"gid": task_gid, "name": task_gid}
+
+            def move_task(self, task_gid, section_gid):
+                self.moved.append((task_gid, section_gid))
+
+            def comment(self, task_gid, text):
+                self.comments.append((task_gid, text))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            provider = FakeProvider()
+            task_orchestrator = orchestrator.TaskOrchestrator(config, provider)
+
+            outcomes = [
+                orchestrator.StageOutcome(
+                    stage="builder",
+                    status="failed",
+                    summary="Builder failed",
+                    report={
+                        "next_action": "Fix builder",
+                        "failures": ["boom"],
+                    },
+                    report_path=tmp_path / "one.json",
+                    log_path=tmp_path / "one.log",
+                    retryable=False,
+                    exit_code=1,
+                ),
+                orchestrator.StageOutcome(
+                    stage="builder",
+                    status="failed",
+                    summary="Builder failed again",
+                    report={
+                        "next_action": "Fix builder",
+                        "failures": ["boom"],
+                    },
+                    report_path=tmp_path / "two.json",
+                    log_path=tmp_path / "two.log",
+                    retryable=False,
+                    exit_code=1,
+                ),
+            ]
+
+            def create_worktree(task_id, attempt, stage="builder", base_ref=None):
+                return tmp_path / f"{task_id}-{attempt}", f"branch-{task_id}"
+
+            task_orchestrator.worktrees.create = create_worktree
+            task_orchestrator.worktrees.remove = lambda path: None
+
+            def run_attempt(task_contract, attempt, attempt_dir, worktree_path):
+                return outcomes.pop(0)
+
+            task_orchestrator._run_attempt = run_attempt
+
+            task_orchestrator.run(once=False)
+
+            failed_moves = [move for move in provider.moved if move[1] == config.sections["failed"]]
+            self.assertEqual(failed_moves, [("task-1", "failed"), ("task-2", "failed")])
+            self.assertEqual(outcomes, [])
+
+
 class WorktreeIsolationTests(unittest.TestCase):
     def test_checkpoint_can_seed_fresh_verifier_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

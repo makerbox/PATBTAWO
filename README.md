@@ -54,8 +54,13 @@ Run from inside the git repository that should receive fresh per-task worktrees:
 
 ```sh
 python -m patbtawo --validate-config --print-config
-python -m patbtawo --once
+python -m patbtawo
 ```
+
+Use `python -m patbtawo --once` when you want a diagnostic run that processes
+at most one Ready task and exits. Without `--once`, PATBTAWO keeps selecting
+the next Ready task until the queue is empty, even when an earlier task finishes
+as Failed or Blocked.
 
 Configuration and provider setup are documented in
 [docs/task-orchestrator.md](docs/task-orchestrator.md), with a starter

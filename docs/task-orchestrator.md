@@ -264,11 +264,18 @@ Process a single task:
 python -m patbtawo --once
 ```
 
+`--once` is intentionally limited to one Ready task. It is useful for a first
+board smoke test or debugging a single ticket.
+
 Process until Ready is empty:
 
 ```sh
 python -m patbtawo
 ```
+
+In this mode, PATBTAWO continues to the next Ready task after a task reaches
+Done, Failed, or Blocked. A stage failure should end that task attempt, not the
+whole queue drain.
 
 Use `--dry-run` or `ORCHESTRATOR_DRY_RUN=true` to skip provider moves/comments
 while still exercising local worktree and stage execution.
