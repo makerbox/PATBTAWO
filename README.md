@@ -6,6 +6,8 @@ PATBTAWO works with Asana, Trello, ClickUp, Jira, monday.com, and custom systems
 Each task attempt runs isolated builder, verifier, and deployer stages; with
 objective verification enabled, the verifier gets a fresh worktree derived from
 the builder checkpoint instead of inheriting the builder's runtime context.
+The Ready queue is consumed top-down using provider-native position or rank data
+where the provider exposes it.
 
 ## Prerequisites
 

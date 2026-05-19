@@ -13,6 +13,7 @@ import argparse
 import base64
 import dataclasses
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,7 @@ SUCCESS_STATUSES = {"success", "succeeded", "pass", "passed", "ok", "done"}
 FAILED_STATUSES = {"failed", "failure", "error", "errored"}
 BLOCKED_STATUSES = {"blocked", "blocker", "external_blocker"}
 TRANSIENT_EXIT_CODES = {75}
+TASK_PAGE_LIMIT = 100
 STAGE_COMMAND_PATH_EXTENSIONS = {
     ".bat",
     ".cmd",
@@ -454,6 +456,67 @@ def output_tail(output: str, *, max_lines: int = 5, max_chars: int = 500) -> str
     return tail
 
 
+def sortable_scalar(value: Any) -> Tuple[int, Any]:
+    if value is None:
+        return (2, "")
+    if isinstance(value, bool):
+        return (0, Decimal(int(value)))
+    if isinstance(value, (int, float, Decimal)):
+        parsed = Decimal(str(value))
+        if not parsed.is_finite():
+            return (1, str(value).lower())
+        return (0, parsed)
+    text = str(value).strip()
+    if not text:
+        return (2, "")
+    try:
+        parsed = Decimal(text)
+        if not parsed.is_finite():
+            return (1, text.lower())
+        return (0, parsed)
+    except InvalidOperation:
+        return (1, text.lower())
+
+
+def first_present_value(item: Mapping[str, Any], fields: Sequence[str]) -> Any:
+    for field in fields:
+        value = item.get(field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def top_down_task(tasks: Sequence[Mapping[str, Any]], *, position_fields: Sequence[str] = ()) -> Optional[Mapping[str, Any]]:
+    if not tasks:
+        return None
+    if not position_fields:
+        return tasks[0]
+
+    indexed = list(enumerate(tasks))
+    if not any(first_present_value(task, position_fields) not in (None, "") for _, task in indexed):
+        return tasks[0]
+
+    def key(pair: Tuple[int, Mapping[str, Any]]) -> Tuple[int, Tuple[int, Any], int]:
+        index, task = pair
+        value = first_present_value(task, position_fields)
+        if value in (None, ""):
+            return (1, sortable_scalar(None), index)
+        return (0, sortable_scalar(value), index)
+
+    return sorted(indexed, key=key)[0][1]
+
+
+def jql_has_order_by(jql: str) -> bool:
+    return bool(re.search(r"\border\s+by\b", jql, flags=re.IGNORECASE))
+
+
+def jql_with_top_down_order(jql: str) -> str:
+    stripped = jql.strip()
+    if jql_has_order_by(stripped):
+        return stripped
+    return f"{stripped} ORDER BY Rank ASC"
+
+
 def lifecycle_states_from_env(provider_name: str, environ: Mapping[str, str]) -> Dict[str, str]:
     states: Dict[str, str] = {}
     for state in ("ready", "building", "verifying", "failed", "deploying", "done", "blocked"):
@@ -492,6 +555,8 @@ def provider_options_from_env(provider_name: str, environ: Mapping[str, str]) ->
     if provider_name == "clickup":
         options = required_env(environ, ["CLICKUP_ACCESS_TOKEN", "CLICKUP_LIST_ID"])
         options["CLICKUP_API_BASE"] = environ.get("CLICKUP_API_BASE", CLICKUP_API_BASE)
+        if environ.get("CLICKUP_VIEW_ID"):
+            options["CLICKUP_VIEW_ID"] = environ["CLICKUP_VIEW_ID"]
         return options
     if provider_name == "jira":
         options = required_env(environ, ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"])
@@ -595,12 +660,13 @@ class AsanaClient:
             "GET",
             f"/sections/{section_gid}/tasks",
             params={
-                "limit": "1",
+                "limit": str(TASK_PAGE_LIMIT),
                 "opt_fields": "gid,name,resource_type,modified_at,permalink_url",
             },
         )
         tasks = response.get("data") or []
-        return tasks[0] if tasks else None
+        task = top_down_task(tasks)
+        return dict(task) if task else None
 
     def get_task_contract(self, task_gid: str) -> Dict[str, Any]:
         response = self._request(
@@ -799,11 +865,11 @@ class TrelloProvider:
         cards = self.http.request(
             "GET",
             f"{TRELLO_API_BASE}/lists/{section_gid}/cards",
-            params=self._params({"limit": 1, "fields": "id,name,desc,url,idList,dateLastActivity"}),
+            params=self._params({"limit": TASK_PAGE_LIMIT, "fields": "id,name,desc,url,idList,dateLastActivity,pos"}),
         )
         if not cards:
             return None
-        card = cards[0]
+        card = top_down_task(cards, position_fields=("pos",)) or cards[0]
         return normalized_task(
             provider="trello",
             task_id=card["id"],
@@ -850,29 +916,51 @@ class TrelloProvider:
 
 
 class ClickUpProvider:
-    def __init__(self, access_token: str, list_id: str, *, dry_run: bool = False, api_base: str = CLICKUP_API_BASE) -> None:
+    def __init__(
+        self,
+        access_token: str,
+        list_id: str,
+        *,
+        dry_run: bool = False,
+        api_base: str = CLICKUP_API_BASE,
+        view_id: str = "",
+    ) -> None:
         self.access_token = access_token
         self.list_id = list_id
         self.dry_run = dry_run
         self.api_base = api_base.rstrip("/")
         self.http = HttpJsonClient()
         self._status_aliases: Optional[Dict[str, str]] = None
+        self.view_id = view_id.strip()
 
     @property
     def headers(self) -> Dict[str, str]:
         return {"Authorization": self.access_token}
 
     def get_next_ready_task(self, section_gid: str) -> Optional[Dict[str, Any]]:
+        tasks = self._ready_tasks(section_gid)
+        position_fields = () if self.view_id else ("orderindex", "order_index", "pos", "position")
+        task = top_down_task(tasks, position_fields=position_fields)
+        return self._normalize(task) if task else None
+
+    def _ready_tasks(self, section_gid: str) -> List[Mapping[str, Any]]:
         ready_values = self._status_match_values(section_gid)
+        if self.view_id:
+            return self._ready_tasks_from_view(ready_values)
+        return self._ready_tasks_from_list(section_gid, ready_values)
+
+    def _ready_tasks_from_list(self, section_gid: str, ready_values: set[str]) -> List[Mapping[str, Any]]:
         status_filter = self._status_api_value(section_gid)
         if self._looks_like_status_id(section_gid) and status_filter.strip().lower() == section_gid.strip().lower():
             status_filter = ""
+        matches: List[Mapping[str, Any]] = []
         for page in range(20):
             params: Dict[str, Any] = {
                 "archived": "false",
                 "include_closed": "true",
                 "subtasks": "true",
                 "page": page,
+                "reverse": "false",
             }
             if status_filter:
                 params["statuses[]"] = [status_filter]
@@ -885,10 +973,27 @@ class ClickUpProvider:
             tasks = response.get("tasks") or []
             for task in tasks:
                 if self._task_matches_status(task, ready_values):
-                    return self._normalize(task)
-            if not tasks:
-                return None
-        return None
+                    matches.append(task)
+            if not tasks or response.get("last_page"):
+                break
+        return matches
+
+    def _ready_tasks_from_view(self, ready_values: set[str]) -> List[Mapping[str, Any]]:
+        matches: List[Mapping[str, Any]] = []
+        for page in range(20):
+            response = self.http.request(
+                "GET",
+                f"{self.api_base}/view/{self.view_id}/task",
+                headers=self.headers,
+                params={"page": page},
+            )
+            tasks = response.get("tasks") or []
+            for task in tasks:
+                if self._task_matches_status(task, ready_values):
+                    matches.append(task)
+            if not tasks or response.get("last_page"):
+                break
+        return matches
 
     def get_task_contract(self, task_gid: str) -> Dict[str, Any]:
         return self._normalize(
@@ -1011,7 +1116,8 @@ class JiraProvider:
         jql = self.options.get("JIRA_READY_JQL")
         if not jql:
             project_key = self.options["JIRA_PROJECT_KEY"]
-            jql = f'project = "{project_key}" AND status = "{section_gid}" ORDER BY created ASC'
+            jql = f'project = "{project_key}" AND status = "{section_gid}"'
+        jql = jql_with_top_down_order(jql)
         response = self._search(jql)
         issues = response.get("issues") or []
         return self._normalize(issues[0]) if issues else None
@@ -1146,7 +1252,7 @@ class MondayProvider:
 query ($board_id: [ID!], $column_id: String!, $value: String!) {
   boards(ids: $board_id) {
     items_page_by_column_values(
-      limit: 1,
+      limit: 100,
       columns: [{column_id: $column_id, column_values: [$value]}]
     ) {
       items { id name url column_values { id text value } }
@@ -1347,6 +1453,7 @@ def build_provider(config: OrchestratorConfig) -> Any:
             config.provider_options["CLICKUP_LIST_ID"],
             dry_run=config.dry_run,
             api_base=config.provider_options.get("CLICKUP_API_BASE", CLICKUP_API_BASE),
+            view_id=config.provider_options.get("CLICKUP_VIEW_ID", ""),
         )
     if config.provider_name == "jira":
         return JiraProvider(config.provider_options, dry_run=config.dry_run)

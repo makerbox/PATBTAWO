@@ -198,7 +198,29 @@ class CommentFormattingTests(unittest.TestCase):
         self.assertIn("Next: Fix the regression in the parser.", lines)
 
 
-class ClickUpProviderTests(unittest.TestCase):
+class ProviderTests(unittest.TestCase):
+    def test_trello_provider_selects_lowest_position_card(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.params = None
+
+            def request(self, method, url, **kwargs):
+                self.params = kwargs["params"]
+                return [
+                    {"id": "bottom", "name": "Bottom", "pos": 200, "url": "https://trello.example/bottom"},
+                    {"id": "top", "name": "Top", "pos": 100, "url": "https://trello.example/top"},
+                ]
+
+        provider = orchestrator.TrelloProvider("key", "token")
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        task = provider.get_next_ready_task("ready-list")
+
+        self.assertEqual(task["gid"], "top")
+        self.assertEqual(fake_http.params["limit"], orchestrator.TASK_PAGE_LIMIT)
+        self.assertIn("pos", fake_http.params["fields"])
+
     def test_clickup_provider_matches_ready_status_by_id(self) -> None:
         class FakeHttp:
             def __init__(self) -> None:
@@ -237,6 +259,77 @@ class ClickUpProviderTests(unittest.TestCase):
         self.assertEqual(task["gid"], "task-1")
         task_request = fake_http.requests[-1]
         self.assertEqual(task_request[2]["params"]["statuses[]"], ["Ready"])
+        self.assertEqual(task_request[2]["params"]["reverse"], "false")
+
+    def test_clickup_provider_selects_lowest_orderindex_task(self) -> None:
+        class FakeHttp:
+            def request(self, method, url, **kwargs):
+                if url.endswith("/list/list-1"):
+                    return {"statuses": [{"id": "p123_ready", "status": "Ready"}]}
+                if url.endswith("/list/list-1/task"):
+                    return {
+                        "last_page": True,
+                        "tasks": [
+                            {
+                                "id": "bottom",
+                                "name": "Bottom",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "200",
+                            },
+                            {
+                                "id": "top",
+                                "name": "Top",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "100",
+                            },
+                        ],
+                    }
+                raise AssertionError(url)
+
+        provider = orchestrator.ClickUpProvider("token", "list-1")
+        provider.http = FakeHttp()
+
+        task = provider.get_next_ready_task("p123_ready")
+
+        self.assertEqual(task["gid"], "top")
+
+    def test_clickup_provider_can_read_ready_tasks_from_view_order(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.urls = []
+
+            def request(self, method, url, **kwargs):
+                self.urls.append(url)
+                if url.endswith("/list/list-1"):
+                    return {"statuses": [{"id": "p123_ready", "status": "Ready"}]}
+                if url.endswith("/view/view-1/task"):
+                    return {
+                        "last_page": True,
+                        "tasks": [
+                            {
+                                "id": "top",
+                                "name": "Top",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "200",
+                            },
+                            {
+                                "id": "bottom",
+                                "name": "Bottom",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "100",
+                            },
+                        ],
+                    }
+                raise AssertionError(url)
+
+        provider = orchestrator.ClickUpProvider("token", "list-1", view_id="view-1")
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        task = provider.get_next_ready_task("p123_ready")
+
+        self.assertEqual(task["gid"], "top")
+        self.assertTrue(any("/view/view-1/task" in url for url in fake_http.urls))
 
     def test_clickup_provider_resolves_status_id_before_move(self) -> None:
         class FakeHttp:
@@ -258,6 +351,63 @@ class ClickUpProviderTests(unittest.TestCase):
         provider.move_task("task-1", "p123_building")
 
         self.assertEqual(fake_http.update_body, {"status": "Building"})
+
+    def test_jira_provider_appends_rank_order_when_missing(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.body = None
+
+            def request(self, method, url, **kwargs):
+                self.body = kwargs["json_body"]
+                return {
+                    "issues": [
+                        {
+                            "id": "10001",
+                            "key": "PAT-1",
+                            "fields": {"summary": "Top issue", "description": "", "status": {"name": "Ready"}},
+                        }
+                    ]
+                }
+
+        provider = orchestrator.JiraProvider(
+            {
+                "JIRA_BASE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_PROJECT_KEY": "PAT",
+            }
+        )
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        task = provider.get_next_ready_task("Ready")
+
+        self.assertEqual(task["gid"], "PAT-1")
+        self.assertTrue(fake_http.body["jql"].endswith("ORDER BY Rank ASC"))
+
+    def test_jira_provider_preserves_explicit_ready_order(self) -> None:
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.body = None
+
+            def request(self, method, url, **kwargs):
+                self.body = kwargs["json_body"]
+                return {"issues": []}
+
+        provider = orchestrator.JiraProvider(
+            {
+                "JIRA_BASE_URL": "https://example.atlassian.net",
+                "JIRA_EMAIL": "user@example.com",
+                "JIRA_API_TOKEN": "token",
+                "JIRA_READY_JQL": "project = PAT AND status = Ready ORDER BY priority DESC",
+            }
+        )
+        fake_http = FakeHttp()
+        provider.http = fake_http
+
+        provider.get_next_ready_task("Ready")
+
+        self.assertEqual(fake_http.body["jql"], "project = PAT AND status = Ready ORDER BY priority DESC")
 
 
 class OrchestratorQueueTests(unittest.TestCase):
@@ -480,6 +630,31 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.provider_name, "trello")
             self.assertEqual(config.sections["ready"], "ready-list")
             self.assertEqual(config.provider_options["TRELLO_API_KEY"], "key")
+
+    def test_clickup_config_keeps_optional_view_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            env = {
+                "ORCHESTRATOR_PROVIDER": "clickup",
+                "CLICKUP_ACCESS_TOKEN": "token",
+                "CLICKUP_LIST_ID": "list-1",
+                "CLICKUP_VIEW_ID": "view-1",
+                "ORCHESTRATOR_STATE_READY_ID": "Ready",
+                "ORCHESTRATOR_STATE_BUILDING_ID": "Building",
+                "ORCHESTRATOR_STATE_VERIFYING_ID": "Verifying",
+                "ORCHESTRATOR_STATE_FAILED_ID": "Failed",
+                "ORCHESTRATOR_STATE_DEPLOYING_ID": "Deploying",
+                "ORCHESTRATOR_STATE_DONE_ID": "Done",
+                "ORCHESTRATOR_STATE_BLOCKED_ID": "Blocked",
+                "ORCHESTRATOR_BUILDER_COMMAND": "build",
+                "ORCHESTRATOR_VERIFIER_COMMAND": "verify",
+            }
+
+            config = orchestrator.OrchestratorConfig.from_env(env, cwd=repo)
+
+            self.assertEqual(config.provider_options["CLICKUP_VIEW_ID"], "view-1")
 
     def test_command_provider_normalizes_arbitrary_payload(self) -> None:
         provider = orchestrator.CommandProvider(

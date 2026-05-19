@@ -87,6 +87,12 @@ The orchestrator processes exactly one Ready task at a time:
     retry limit is exhausted.
 19. Continue until the Ready queue is empty.
 
+The Ready queue is consumed top-down. PATBTAWO uses each provider's native
+board/list position when it is available, such as Trello `pos`, ClickUp
+`orderindex` or view order, and Jira `Rank ASC`. Providers that do not expose a
+separate position field are consumed in the order their board/list endpoint
+returns.
+
 State is stored in `.orchestrator/artifacts/orchestrator_state.json` by default.
 If the process is interrupted, the next run removes the incomplete worktree,
 creates a fresh one for the same task, and continues.
@@ -186,6 +192,8 @@ ClickUp:
 ORCHESTRATOR_PROVIDER=clickup
 CLICKUP_ACCESS_TOKEN=
 CLICKUP_LIST_ID=
+# Optional, recommended when you need exact visible order from a ClickUp view.
+CLICKUP_VIEW_ID=
 CLICKUP_STATUS_READY=Ready
 CLICKUP_STATUS_BUILDING=Building
 CLICKUP_STATUS_VERIFYING=Verifying
@@ -197,7 +205,9 @@ CLICKUP_STATUS_BLOCKED=Blocked
 
 ClickUp lifecycle values may be either status names (`Ready`) or status IDs
 (`p901...`). PATBTAWO resolves status IDs through the List metadata before
-filtering tasks or moving tasks.
+filtering tasks or moving tasks. If the raw List API order does not match the
+order you see in ClickUp, set `CLICKUP_VIEW_ID` to the List or Board view you
+want PATBTAWO to consume from.
 
 Jira:
 
@@ -218,7 +228,9 @@ JIRA_TRANSITION_BLOCKED_ID=
 
 For Jira, lifecycle values after Ready may be transition IDs, transition names,
 or destination status names. Set `JIRA_READY_JQL` to override the default Ready
-query. The adapter tries Jira's enhanced `/search/jql` endpoint and falls back
+query. PATBTAWO appends `ORDER BY Rank ASC` when the Ready JQL does not already
+provide an `ORDER BY` clause, so Jira boards are consumed in rank order by
+default. The adapter tries Jira's enhanced `/search/jql` endpoint and falls back
 to `/search`; set `JIRA_SEARCH_ENDPOINT` if your Jira site requires a specific
 search path.
 
@@ -254,7 +266,9 @@ ORCHESTRATOR_COMMAND_COMMENT_TASK=./provider-comment
 `id`, `gid`, or `key`; optional fields include `name`, `title`, `summary`,
 `notes`, `description`, and `url`. `MOVE_TASK` receives `ORCHESTRATOR_TASK_ID`,
 `ORCHESTRATOR_STATE`, and `ORCHESTRATOR_STATE_VALUE`. `COMMENT_TASK` receives
-`ORCHESTRATOR_TASK_ID` and `ORCHESTRATOR_COMMENT_TEXT`.
+`ORCHESTRATOR_TASK_ID` and `ORCHESTRATOR_COMMENT_TEXT`. The command provider's
+`NEXT_TASK` hook is responsible for returning the top Ready item from its
+underlying system.
 
 ## Run
 
