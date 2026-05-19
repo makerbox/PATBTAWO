@@ -162,6 +162,19 @@ class CommentFormattingTests(unittest.TestCase):
         self.assertIn("Summary: Tests failed.", lines)
         self.assertIn("Next: Fix the failing test.", lines)
 
+    def test_human_comment_intro_explains_failures_with_because(self) -> None:
+        lines = orchestrator.human_comment_intro(
+            status="failed",
+            stage="verifier",
+            attempt="1/2",
+            summary="Tests failed.",
+            next_action="Fix the regression in the parser",
+            failures=["pytest reported 3 failing parser cases"],
+        )
+
+        self.assertIn("Summary: Tests failed because pytest reported 3 failing parser cases.", lines)
+        self.assertIn("Next: Fix the regression in the parser.", lines)
+
 
 class WorktreeIsolationTests(unittest.TestCase):
     def test_checkpoint_can_seed_fresh_verifier_worktree(self) -> None:

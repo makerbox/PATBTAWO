@@ -1556,6 +1556,44 @@ def tracked_changed_files(worktree_path: Path) -> List[str]:
     return sorted(set(changed))
 
 
+def ensure_sentence(value: str) -> str:
+    trimmed = value.strip()
+    if not trimmed:
+        return ""
+    return trimmed if trimmed[-1] in ".!?" else trimmed + "."
+
+
+def strip_sentence_end(value: str) -> str:
+    return value.strip().rstrip(".!?").strip()
+
+
+def summarize_failures(failures: Optional[Sequence[Any]], *, limit: int = 2) -> str:
+    if not failures:
+        return ""
+    summaries: List[str] = []
+    for failure in failures:
+        if isinstance(failure, Mapping):
+            text = str(
+                failure.get("summary")
+                or failure.get("message")
+                or failure.get("reason")
+                or failure.get("name")
+                or json.dumps(failure, sort_keys=True)
+            )
+        else:
+            text = str(failure)
+        text = " ".join(text.split())
+        if text:
+            summaries.append(strip_sentence_end(text))
+        if len(summaries) >= limit:
+            break
+    if not summaries:
+        return ""
+    if len(failures) > limit:
+        summaries.append(f"{len(failures) - limit} more issue(s)")
+    return "; ".join(summaries)[:500]
+
+
 def human_comment_intro(
     *,
     status: str,
@@ -1563,6 +1601,7 @@ def human_comment_intro(
     attempt: str,
     summary: str,
     next_action: str,
+    failures: Optional[Sequence[Any]] = None,
 ) -> List[str]:
     status_labels = {
         "done": "PATBTAWO finished this task successfully.",
@@ -1577,10 +1616,17 @@ def human_comment_intro(
         headline,
         f"Stage: {stage}. Attempt: {attempt}.",
     ]
+    reason = summarize_failures(failures)
     if summary:
-        lines.append(f"Summary: {summary[:500]}")
+        clean_summary = summary[:500].strip()
+        if reason and " because " not in clean_summary.lower():
+            lines.append(f"Summary: {strip_sentence_end(clean_summary)} because {ensure_sentence(reason)}")
+        else:
+            lines.append(f"Summary: {ensure_sentence(clean_summary)}")
+    elif reason:
+        lines.append(f"Summary: This happened because {ensure_sentence(reason)}")
     if next_action:
-        lines.append(f"Next: {next_action[:500]}")
+        lines.append(f"Next: {ensure_sentence(next_action[:500])}")
     return lines
 
 
@@ -1869,6 +1915,7 @@ class TaskOrchestrator:
             attempt=f"{attempt}/{max_attempts}",
             summary=outcome.summary,
             next_action=next_action,
+            failures=outcome.report.get("failures") if isinstance(outcome.report.get("failures"), list) else None,
             artifacts=[str(outcome.report_path), str(outcome.log_path)],
         )
 
@@ -1881,6 +1928,7 @@ class TaskOrchestrator:
         attempt: str,
         summary: str,
         next_action: str,
+        failures: Optional[Sequence[Any]] = None,
         artifacts: Optional[Sequence[str]] = None,
     ) -> None:
         human_lines = human_comment_intro(
@@ -1889,6 +1937,7 @@ class TaskOrchestrator:
             attempt=attempt,
             summary=summary,
             next_action=next_action,
+            failures=failures,
         )
         lines = [
             *human_lines,
