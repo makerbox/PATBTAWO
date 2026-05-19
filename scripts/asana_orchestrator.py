@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,21 @@ SUCCESS_STATUSES = {"success", "succeeded", "pass", "passed", "ok", "done"}
 FAILED_STATUSES = {"failed", "failure", "error", "errored"}
 BLOCKED_STATUSES = {"blocked", "blocker", "external_blocker"}
 TRANSIENT_EXIT_CODES = {75}
+STAGE_COMMAND_PATH_EXTENSIONS = {
+    ".bat",
+    ".cmd",
+    ".js",
+    ".json",
+    ".md",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".sh",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
+SHELL_CONTROL_TOKENS = {"&&", "||", "|", ";", "(", ")"}
 
 
 class ConfigError(RuntimeError):
@@ -354,6 +370,88 @@ def first_env(environ: Mapping[str, str], names: Sequence[str], *, required: boo
     if required:
         raise MissingConfigError("Missing required configuration: " + " or ".join(names))
     return ""
+
+
+def command_tokens(command: str) -> List[str]:
+    try:
+        tokens = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        return []
+    return [token.strip("\"'") for token in tokens if token.strip("\"'")]
+
+
+def is_local_path_token(token: str) -> bool:
+    stripped = token.strip().strip("\"'")
+    if not stripped or stripped.startswith("-"):
+        return False
+    if stripped in SHELL_CONTROL_TOKENS or "://" in stripped:
+        return False
+    if "$" in stripped or "%" in stripped:
+        return False
+    if any(char in stripped for char in "*?<>"):
+        return False
+    normalized = stripped.replace("\\", "/")
+    suffix = Path(normalized).suffix.lower()
+    return (
+        suffix in STAGE_COMMAND_PATH_EXTENSIONS
+        or normalized.startswith("./")
+        or normalized.startswith("../")
+        or "/" in normalized
+    )
+
+
+def referenced_local_paths(command: str, repo_root: Path) -> List[Tuple[str, Path]]:
+    paths: List[Tuple[str, Path]] = []
+    seen: set[str] = set()
+    for token in command_tokens(command):
+        if not is_local_path_token(token):
+            continue
+        raw_path = Path(os.path.expanduser(os.path.expandvars(token)))
+        resolved = raw_path if raw_path.is_absolute() else repo_root / raw_path
+        key = str(resolved)
+        if key not in seen:
+            paths.append((token, resolved))
+            seen.add(key)
+    return paths
+
+
+def validate_runtime_config(config: "OrchestratorConfig") -> None:
+    checks: List[Tuple[str, Optional[str]]] = [
+        ("builder", config.builder_command),
+        ("verifier", config.verifier_command),
+    ]
+    if config.deploy_enabled:
+        checks.extend(
+            [
+                ("deployer", config.deploy_command),
+                ("smoke", config.smoke_command),
+            ]
+        )
+
+    errors: List[str] = []
+    for stage, command in checks:
+        if not command:
+            continue
+        missing = [(token, path) for token, path in referenced_local_paths(command, config.repo_root) if not path.exists()]
+        for token, path in missing:
+            errors.append(
+                f"{stage} command references missing local path '{token}' "
+                f"(resolved to {path}). Set the stage command to a real agent/script "
+                "that writes JSON to ORCHESTRATOR_REPORT_PATH."
+            )
+
+    if errors:
+        raise ConfigError("Stage command configuration is invalid:\n- " + "\n- ".join(errors))
+
+
+def output_tail(output: str, *, max_lines: int = 5, max_chars: int = 500) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = " / ".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        return "..." + tail[-max_chars:]
+    return tail
 
 
 def lifecycle_states_from_env(provider_name: str, environ: Mapping[str, str]) -> Dict[str, str]:
@@ -1468,7 +1566,12 @@ class StageRunner:
 
         command_failed = exit_code not in (0, None)
         if timed_out:
-            validation_failures.append("stage command timed out")
+            validation_failures.insert(0, "stage command timed out")
+        if command_failed:
+            validation_failures.insert(0, f"stage command exited with code {exit_code}")
+        tail = output_tail(output)
+        if tail and validation_failures:
+            validation_failures.insert(1 if command_failed else 0, f"stage output: {tail}")
         if exit_code not in (0, None) and normalize_status(report.get("status")) == "success":
             validation_failures.append("stage command exited non-zero while report status was success")
         if exit_code == 0 and normalize_status(report.get("status")) == "unknown":
@@ -2100,6 +2203,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if args.print_config:
             print(json.dumps(config.redacted_dict(), indent=2, sort_keys=True))
+        validate_runtime_config(config)
         if args.validate_config:
             print("Configuration OK.")
             return 0

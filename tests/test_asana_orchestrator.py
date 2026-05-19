@@ -146,6 +146,28 @@ print("hello from stage")
             self.assertTrue(outcome.report_path.exists())
             self.assertIn("missing report file", "\n".join(outcome.report["failures"]))
 
+    def test_stage_runner_includes_command_output_when_report_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            missing = tmp_path / "missing_builder.py"
+
+            runner = orchestrator.StageRunner(make_config(tmp_path))
+            outcome = runner.run(
+                stage="builder",
+                command=f'"{sys.executable}" "{missing}"',
+                task_contract={"gid": "789", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            failures = "\n".join(outcome.report["failures"])
+            self.assertIn("stage command exited with code", failures)
+            self.assertIn("stage output:", failures)
+            self.assertIn("missing report file", failures)
+
 
 class CommentFormattingTests(unittest.TestCase):
     def test_human_comment_intro_precedes_structured_payload(self) -> None:
@@ -417,6 +439,21 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.provider_name, "asana")
             self.assertEqual(config.retry_limit, 2)
             self.assertFalse(config.deploy_enabled)
+
+    def test_validate_runtime_config_rejects_missing_stage_script(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                builder_command="python scripts/builder.py",
+            )
+
+            with self.assertRaises(orchestrator.ConfigError) as context:
+                orchestrator.validate_runtime_config(config)
+
+            message = str(context.exception)
+            self.assertIn("builder command references missing local path", message)
+            self.assertIn("scripts/builder.py", message)
 
     def test_trello_config_uses_list_state_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

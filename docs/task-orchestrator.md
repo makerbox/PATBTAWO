@@ -141,6 +141,12 @@ Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other executabl
 workflow. The orchestrator starts a fresh subprocess for each stage and passes a
 fresh `ORCHESTRATOR_SUBAGENT_ID` plus the stage role through the environment.
 
+Do not leave the backward-compatible aliases pointed at placeholder scripts such
+as `python scripts/builder.py` unless those files exist in the target repository.
+`python -m patbtawo --validate-config` checks obvious local path references before
+any task is moved, so a missing stage script fails fast instead of sending every
+Ready task to Failed.
+
 ## Providers
 
 Asana:

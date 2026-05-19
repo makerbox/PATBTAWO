@@ -62,6 +62,11 @@ at most one Ready task and exits. Without `--once`, PATBTAWO keeps selecting
 the next Ready task until the queue is empty, even when an earlier task finishes
 as Failed or Blocked.
 
+Before starting a real board run, make sure the builder and verifier commands in
+`.env` point at real agent commands or scripts in the target repository. The
+commands must write JSON to `ORCHESTRATOR_REPORT_PATH`; validation catches
+obvious missing local paths before tasks are moved.
+
 Configuration and provider setup are documented in
 [docs/task-orchestrator.md](docs/task-orchestrator.md), with a starter
 environment file in [.env.example](.env.example).
