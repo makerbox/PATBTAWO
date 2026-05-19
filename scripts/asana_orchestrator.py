@@ -32,6 +32,7 @@ ASANA_API_BASE = "https://app.asana.com/api/1.0"
 TRELLO_API_BASE = "https://api.trello.com/1"
 CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
 MONDAY_API_BASE = "https://api.monday.com/v2"
+CLICKUP_TASK_ORDER_MODES = {"api", "orderindex"}
 REQUIRED_REPORT_KEYS = (
     "task_id",
     "status",
@@ -641,8 +642,15 @@ def provider_options_from_env(provider_name: str, environ: Mapping[str, str]) ->
     if provider_name == "clickup":
         options = required_env(environ, ["CLICKUP_ACCESS_TOKEN", "CLICKUP_LIST_ID"])
         options["CLICKUP_API_BASE"] = environ.get("CLICKUP_API_BASE", CLICKUP_API_BASE)
+        options["CLICKUP_TASK_ORDER"] = (environ.get("CLICKUP_TASK_ORDER") or "api").strip().lower() or "api"
+        options["CLICKUP_TASK_REVERSE"] = environ.get("CLICKUP_TASK_REVERSE", "true")
         if environ.get("CLICKUP_VIEW_ID"):
             options["CLICKUP_VIEW_ID"] = environ["CLICKUP_VIEW_ID"]
+        if options["CLICKUP_TASK_ORDER"] not in CLICKUP_TASK_ORDER_MODES:
+            raise ConfigError(
+                "CLICKUP_TASK_ORDER must be one of: "
+                + ", ".join(sorted(CLICKUP_TASK_ORDER_MODES))
+            )
         return options
     if provider_name == "jira":
         options = required_env(environ, ["JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"])
@@ -1010,6 +1018,8 @@ class ClickUpProvider:
         dry_run: bool = False,
         api_base: str = CLICKUP_API_BASE,
         view_id: str = "",
+        task_order: str = "api",
+        task_reverse: str = "true",
     ) -> None:
         self.access_token = access_token
         self.list_id = list_id
@@ -1018,6 +1028,8 @@ class ClickUpProvider:
         self.http = HttpJsonClient()
         self._status_aliases: Optional[Dict[str, str]] = None
         self.view_id = view_id.strip()
+        self.task_order = task_order.strip().lower() or "api"
+        self.task_reverse = "false" if falsey(task_reverse) else "true"
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -1025,7 +1037,9 @@ class ClickUpProvider:
 
     def get_next_ready_task(self, section_gid: str) -> Optional[Dict[str, Any]]:
         tasks = self._ready_tasks(section_gid)
-        position_fields = () if self.view_id else ("orderindex", "order_index", "pos", "position")
+        position_fields = ()
+        if not self.view_id and self.task_order == "orderindex":
+            position_fields = ("orderindex", "order_index", "pos", "position")
         task = top_down_task(tasks, position_fields=position_fields)
         return self._normalize(task) if task else None
 
@@ -1046,7 +1060,7 @@ class ClickUpProvider:
                 "include_closed": "true",
                 "subtasks": "true",
                 "page": page,
-                "reverse": "false",
+                "reverse": self.task_reverse,
             }
             if status_filter:
                 params["statuses[]"] = [status_filter]
@@ -1540,6 +1554,8 @@ def build_provider(config: OrchestratorConfig) -> Any:
             dry_run=config.dry_run,
             api_base=config.provider_options.get("CLICKUP_API_BASE", CLICKUP_API_BASE),
             view_id=config.provider_options.get("CLICKUP_VIEW_ID", ""),
+            task_order=config.provider_options.get("CLICKUP_TASK_ORDER", "api"),
+            task_reverse=config.provider_options.get("CLICKUP_TASK_REVERSE", "true"),
         )
     if config.provider_name == "jira":
         return JiraProvider(config.provider_options, dry_run=config.dry_run)

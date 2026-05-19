@@ -88,8 +88,8 @@ The orchestrator processes exactly one Ready task at a time:
 19. Continue until the Ready queue is empty.
 
 The Ready queue is consumed top-down. PATBTAWO uses each provider's native
-board/list position when it is available, such as Trello `pos`, ClickUp
-`orderindex` or view order, and Jira `Rank ASC`. Providers that do not expose a
+list, view, position, or rank order where it is available, such as Trello `pos`,
+ClickUp API/view order, and Jira `Rank ASC`. Providers that do not expose a
 separate position field are consumed in the order their board/list endpoint
 returns.
 
@@ -251,6 +251,11 @@ CLICKUP_ACCESS_TOKEN=
 CLICKUP_LIST_ID=
 # Optional, recommended when you need exact visible order from a ClickUp view.
 CLICKUP_VIEW_ID=
+# Optional: api preserves ClickUp's returned order; orderindex sorts explicitly.
+CLICKUP_TASK_ORDER=api
+# Optional: passed to ClickUp's List tasks endpoint. The default matches ClickUp
+# top-down order for status-grouped List data in the demo project.
+CLICKUP_TASK_REVERSE=true
 CLICKUP_STATUS_READY=Ready
 CLICKUP_STATUS_BUILDING=Building
 CLICKUP_STATUS_VERIFYING=Verifying
@@ -262,9 +267,10 @@ CLICKUP_STATUS_BLOCKED=Blocked
 
 ClickUp lifecycle values may be either status names (`Ready`) or status IDs
 (`p901...`). PATBTAWO resolves status IDs through the List metadata before
-filtering tasks or moving tasks. If the raw List API order does not match the
-order you see in ClickUp, set `CLICKUP_VIEW_ID` to the List or Board view you
-want PATBTAWO to consume from.
+filtering tasks or moving tasks. PATBTAWO preserves ClickUp's returned task
+order by default. If the raw List API order does not match the order you see in
+ClickUp, set `CLICKUP_VIEW_ID` to the List or Board view you want PATBTAWO to
+consume from, or adjust `CLICKUP_TASK_REVERSE`.
 
 Jira:
 

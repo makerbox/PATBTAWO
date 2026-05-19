@@ -404,7 +404,39 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(task["gid"], "task-1")
         task_request = fake_http.requests[-1]
         self.assertEqual(task_request[2]["params"]["statuses[]"], ["Ready"])
-        self.assertEqual(task_request[2]["params"]["reverse"], "false")
+        self.assertEqual(task_request[2]["params"]["reverse"], "true")
+
+    def test_clickup_provider_preserves_list_api_order_by_default(self) -> None:
+        class FakeHttp:
+            def request(self, method, url, **kwargs):
+                if url.endswith("/list/list-1"):
+                    return {"statuses": [{"id": "p123_ready", "status": "Ready"}]}
+                if url.endswith("/list/list-1/task"):
+                    return {
+                        "last_page": True,
+                        "tasks": [
+                            {
+                                "id": "top",
+                                "name": "Top",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "200",
+                            },
+                            {
+                                "id": "lower-orderindex",
+                                "name": "Lower orderindex",
+                                "status": {"id": "p123_ready", "status": "Ready"},
+                                "orderindex": "100",
+                            },
+                        ],
+                    }
+                raise AssertionError(url)
+
+        provider = orchestrator.ClickUpProvider("token", "list-1")
+        provider.http = FakeHttp()
+
+        task = provider.get_next_ready_task("p123_ready")
+
+        self.assertEqual(task["gid"], "top")
 
     def test_clickup_provider_selects_lowest_orderindex_task(self) -> None:
         class FakeHttp:
@@ -431,7 +463,7 @@ class ProviderTests(unittest.TestCase):
                     }
                 raise AssertionError(url)
 
-        provider = orchestrator.ClickUpProvider("token", "list-1")
+        provider = orchestrator.ClickUpProvider("token", "list-1", task_order="orderindex")
         provider.http = FakeHttp()
 
         task = provider.get_next_ready_task("p123_ready")
@@ -869,6 +901,33 @@ class ConfigTests(unittest.TestCase):
             config = orchestrator.OrchestratorConfig.from_env(env, cwd=repo)
 
             self.assertEqual(config.provider_options["CLICKUP_VIEW_ID"], "view-1")
+
+    def test_clickup_config_keeps_order_options(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            env = {
+                "ORCHESTRATOR_PROVIDER": "clickup",
+                "CLICKUP_ACCESS_TOKEN": "token",
+                "CLICKUP_LIST_ID": "list-1",
+                "CLICKUP_TASK_ORDER": "orderindex",
+                "CLICKUP_TASK_REVERSE": "false",
+                "ORCHESTRATOR_STATE_READY_ID": "Ready",
+                "ORCHESTRATOR_STATE_BUILDING_ID": "Building",
+                "ORCHESTRATOR_STATE_VERIFYING_ID": "Verifying",
+                "ORCHESTRATOR_STATE_FAILED_ID": "Failed",
+                "ORCHESTRATOR_STATE_DEPLOYING_ID": "Deploying",
+                "ORCHESTRATOR_STATE_DONE_ID": "Done",
+                "ORCHESTRATOR_STATE_BLOCKED_ID": "Blocked",
+                "ORCHESTRATOR_BUILDER_COMMAND": "build",
+                "ORCHESTRATOR_VERIFIER_COMMAND": "verify",
+            }
+
+            config = orchestrator.OrchestratorConfig.from_env(env, cwd=repo)
+
+            self.assertEqual(config.provider_options["CLICKUP_TASK_ORDER"], "orderindex")
+            self.assertEqual(config.provider_options["CLICKUP_TASK_REVERSE"], "false")
 
     def test_command_provider_normalizes_arbitrary_payload(self) -> None:
         provider = orchestrator.CommandProvider(
