@@ -20,6 +20,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -213,6 +214,37 @@ def ensure_under(path: Path, root: Path) -> None:
         path_resolved.relative_to(root_resolved)
     except ValueError as exc:
         raise ConfigError(f"Refusing to manage path outside {root_resolved}: {path_resolved}") from exc
+
+
+def make_writable(path: str) -> None:
+    try:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE | stat.S_IEXEC)
+    except OSError:
+        pass
+
+
+def rmtree_with_retries(path: Path, *, attempts: int = 5, delay_seconds: float = 0.25) -> Optional[Exception]:
+    last_error: Optional[Exception] = None
+
+    def onerror(func: Any, failed_path: str, _exc_info: Any) -> None:
+        make_writable(failed_path)
+        try:
+            func(failed_path)
+        except Exception as exc:  # pragma: no cover - exercised through shutil internals
+            raise exc
+
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path, onerror=onerror)
+            return None
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            time.sleep(delay_seconds * attempt)
+    return last_error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1610,7 +1642,13 @@ class WorktreeManager:
         print(f"Removing worktree {path}")
         run_local(["git", "worktree", "remove", "--force", str(path)], cwd=self.config.repo_root, check=False)
         if path.exists():
-            shutil.rmtree(path)
+            error = rmtree_with_retries(path)
+            if error and path.exists():
+                print(
+                    "Warning: could not remove worktree "
+                    f"{path}: {error}. Close any shells, editors, or scanners using it; "
+                    "PATBTAWO will continue with a fresh worktree."
+                )
         run_local(["git", "worktree", "prune"], cwd=self.config.repo_root, check=False)
 
 

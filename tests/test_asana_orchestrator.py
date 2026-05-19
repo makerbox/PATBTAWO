@@ -5,10 +5,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -630,6 +632,39 @@ class OrchestratorQueueTests(unittest.TestCase):
 
 
 class WorktreeIsolationTests(unittest.TestCase):
+    def test_remove_handles_read_only_worktree_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            manager = orchestrator.WorktreeManager(config)
+            worktree = config.worktree_root / "task-attempt-1-builder"
+            docs = worktree / "docs"
+            docs.mkdir(parents=True)
+            read_only_file = docs / "note.txt"
+            read_only_file.write_text("locked down\n", encoding="utf-8")
+            os.chmod(read_only_file, stat.S_IREAD)
+
+            manager.remove(worktree)
+
+            self.assertFalse(worktree.exists())
+
+    def test_remove_warns_instead_of_crashing_when_worktree_is_locked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            manager = orchestrator.WorktreeManager(config)
+            worktree = config.worktree_root / "task-attempt-1-builder"
+            worktree.mkdir(parents=True)
+
+            with mock.patch.object(orchestrator.shutil, "rmtree", side_effect=PermissionError("locked")):
+                with mock.patch.object(orchestrator.time, "sleep"):
+                    with mock.patch("builtins.print") as print_mock:
+                        manager.remove(worktree)
+
+            self.assertTrue(worktree.exists())
+            printed = "\n".join(" ".join(str(part) for part in call.args) for call in print_mock.call_args_list)
+            self.assertIn("Warning: could not remove worktree", printed)
+
     def test_checkpoint_can_seed_fresh_verifier_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
