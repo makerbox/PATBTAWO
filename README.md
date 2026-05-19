@@ -23,9 +23,8 @@ where the provider exposes it.
   [ClickUp personal token](https://developer.clickup.com/docs/authentication),
   [Jira API token](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/),
   or [monday.com API token](https://developer.monday.com/api-reference/docs/authentication).
-- At least one stage runner command, such as Codex, Claude Code, BMAD,
-  LangGraph, a shell script, or a CI wrapper. Each stage command must write the
-  required JSON report to `ORCHESTRATOR_REPORT_PATH`.
+- A builder run command for the packaged builder adapter, such as Codex, Claude
+  Code, BMAD, LangGraph, a shell script, or a CI wrapper.
 
 You can run PATBTAWO directly from a checkout without installing it:
 
@@ -64,14 +63,13 @@ at most one Ready task and exits. Without `--once`, PATBTAWO keeps selecting
 the next Ready task until the queue is empty, even when an earlier task finishes
 as Failed or Blocked.
 
-Before starting a real board run, make sure the builder and verifier commands in
-`.env` point at real agent commands or scripts in the target repository. The
-commands must write JSON to `ORCHESTRATOR_REPORT_PATH`; validation catches
-obvious missing local paths before tasks are moved.
+Before starting a real board run, keep the packaged stage adapter commands in
+`.env` and set `PATBTAWO_BUILDER_RUN_COMMAND` to the coding agent or script that
+should perform task work. The adapters write the required JSON reports for you.
 
-Deployment is opt-in. Set `ORCHESTRATOR_DEPLOY_ENABLED=true`, provide
-`ORCHESTRATOR_DEPLOYER_AGENT_COMMAND` or `ORCHESTRATOR_DEPLOY_COMMAND`, and pass
-target details such as `ORCHESTRATOR_DEPLOY_HOST` through `.env`.
+Deployment is opt-in. Set `ORCHESTRATOR_DEPLOY_ENABLED=true`, set
+`PATBTAWO_DEPLOY_RUN_COMMAND`, and pass target details such as
+`ORCHESTRATOR_DEPLOY_HOST` through `.env`.
 
 Configuration and provider setup are documented in
 [docs/task-orchestrator.md](docs/task-orchestrator.md), with a starter
@@ -84,13 +82,11 @@ operate on:
 
 ```text
 Set up PATBTAWO for this repository. Inspect the existing build, test, and
-deploy commands. Create or update local builder, verifier, and optional deployer
-stage scripts so each one writes the required JSON report to
-ORCHESTRATOR_REPORT_PATH. The verifier must be objective and read-only. Prepare
-a .env from .env.example for my chosen provider, leaving secrets blank and
-documenting exactly which IDs/tokens I need to fill in. Do not commit secrets.
-Run the tests or closest available sanity checks and summarize the final
-commands I should use.
+deploy commands. Prepare a .env from .env.example for my chosen provider, leave
+secrets blank, and set PATBTAWO_BUILDER_RUN_COMMAND,
+PATBTAWO_VERIFIER_RUN_COMMAND, and optional PATBTAWO_DEPLOY_RUN_COMMAND to the
+right commands for this repo. Do not commit secrets. Run the tests or closest
+available sanity checks and summarize the final commands I should use.
 ```
 
 ## Naming

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -212,6 +213,103 @@ with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
             self.assertIn("stage command exited with code", failures)
             self.assertIn("stage output:", failures)
             self.assertIn("missing report file", failures)
+
+
+class BuiltinStageAdapterTests(unittest.TestCase):
+    def stage_env(self, tmp_path: Path, *, stage: str, task_id: str = "TASK-1") -> dict[str, str]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(ROOT)
+        env["ORCHESTRATOR_STAGE"] = stage
+        env["ORCHESTRATOR_TASK_ID"] = task_id
+        env["ORCHESTRATOR_TASK_NAME"] = "Task"
+        env["ORCHESTRATOR_REPORT_PATH"] = str(tmp_path / "artifacts" / f"{stage}_report.json")
+        env["ORCHESTRATOR_LOG_PATH"] = str(tmp_path / "artifacts" / f"{stage}.log")
+        env["ORCHESTRATOR_ARTIFACT_DIR"] = str(tmp_path / "artifacts")
+        return env
+
+    def test_packaged_builder_writes_blocked_report_without_inner_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = self.stage_env(tmp_path, stage="builder")
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.builder"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(report["status"], "blocked")
+            self.assertEqual(report["task_id"], "TASK-1")
+            self.assertIn("PATBTAWO_BUILDER_RUN_COMMAND", report["next_action"])
+
+    def test_packaged_verifier_autodetects_unittest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            tests_dir = tmp_path / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_sample.py").write_text(
+                "import unittest\n\nclass Sample(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            env = self.stage_env(tmp_path, stage="verifier")
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.verifier"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(report["status"], "success")
+            self.assertIn("unittest discover", report["checks"][0]["command"])
+
+    def test_packaged_smoke_merges_existing_deploy_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = self.stage_env(tmp_path, stage="deployer")
+            report_path = Path(env["ORCHESTRATOR_REPORT_PATH"])
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "task_id": "TASK-1",
+                        "status": "success",
+                        "summary": "deployed",
+                        "changed_files": [],
+                        "checks": [{"name": "deploy command", "status": "passed"}],
+                        "failures": [],
+                        "next_action": "smoke",
+                        "artifact_paths": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            smoke = tmp_path / "smoke.py"
+            smoke.write_text("print('smoke ok')\n", encoding="utf-8")
+            env["PATBTAWO_SMOKE_RUN_COMMAND"] = f'"{sys.executable}" "{smoke}"'
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.smoke"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(report["status"], "success")
+            self.assertEqual([check["name"] for check in report["checks"]], ["deploy command", "smoke command"])
 
 
 class CommentFormattingTests(unittest.TestCase):

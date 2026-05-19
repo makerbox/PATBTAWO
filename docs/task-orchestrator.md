@@ -110,8 +110,14 @@ ORCHESTRATOR_STATE_FAILED_ID=
 ORCHESTRATOR_STATE_DEPLOYING_ID=
 ORCHESTRATOR_STATE_DONE_ID=
 ORCHESTRATOR_STATE_BLOCKED_ID=
-ORCHESTRATOR_BUILDER_AGENT_COMMAND=codex run ./agents/developer.md
-ORCHESTRATOR_VERIFIER_AGENT_COMMAND=codex run ./agents/verifier.md
+ORCHESTRATOR_BUILDER_AGENT_COMMAND=python -m patbtawo.builder
+ORCHESTRATOR_VERIFIER_AGENT_COMMAND=python -m patbtawo.verifier
+ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python -m patbtawo.deployer
+ORCHESTRATOR_SMOKE_COMMAND=python -m patbtawo.smoke
+PATBTAWO_BUILDER_RUN_COMMAND=
+PATBTAWO_VERIFIER_RUN_COMMAND=
+PATBTAWO_DEPLOY_RUN_COMMAND=
+PATBTAWO_SMOKE_RUN_COMMAND=
 ```
 
 Provider-specific aliases are supported. For example, Asana can use
@@ -137,22 +143,35 @@ Optional local behavior:
 - `ORCHESTRATOR_VERIFIER_COMMAND`, backward-compatible alias
 - `ORCHESTRATOR_DEPLOY_COMMAND`
 - `ORCHESTRATOR_SMOKE_COMMAND`
+- `PATBTAWO_BUILDER_RUN_COMMAND`
+- `PATBTAWO_VERIFIER_RUN_COMMAND`
+- `PATBTAWO_DEPLOY_RUN_COMMAND`
+- `PATBTAWO_SMOKE_RUN_COMMAND`
+
+The `ORCHESTRATOR_*_AGENT_COMMAND` values are outer stage adapters. The packaged
+`python -m patbtawo.builder`, `python -m patbtawo.verifier`,
+`python -m patbtawo.deployer`, and `python -m patbtawo.smoke` adapters always
+write the required JSON reports. Configure the underlying repo-specific work
+with the `PATBTAWO_*_RUN_COMMAND` variables.
 
 Deploy runs only when enabled or when a deploy/smoke command is set. If both
 deploy and smoke commands are set, they run as one deployer stage joined with
-`&&`; the stage must still write one deployer report.
+`&&`; the packaged smoke adapter merges its smoke check into the deployer report.
 
 PATBTAWO does not infer where production is. Configure a deployer command and
 pass the target details as environment variables:
 
 ```sh
 ORCHESTRATOR_DEPLOY_ENABLED=true
-ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python scripts/deploy.py
-ORCHESTRATOR_SMOKE_COMMAND=python scripts/smoke.py
+ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python -m patbtawo.deployer
+ORCHESTRATOR_SMOKE_COMMAND=python -m patbtawo.smoke
+PATBTAWO_DEPLOY_RUN_COMMAND=./scripts/deploy-prod
+PATBTAWO_SMOKE_RUN_COMMAND=
 ORCHESTRATOR_DEPLOY_HOST=prod.example.com
 ORCHESTRATOR_DEPLOY_USER=deploy
 ORCHESTRATOR_DEPLOY_PATH=/srv/app
 ORCHESTRATOR_DEPLOY_SSH_KEY_PATH=~/.ssh/patbtawo_deploy
+ORCHESTRATOR_SMOKE_URL=https://prod.example.com
 ```
 
 `ORCHESTRATOR_DEPLOY_*` values, except PATBTAWO's own deploy command/enabled
@@ -174,16 +193,16 @@ ORCHESTRATOR_STAGE_ENV_PRODUCTION_HOST=prod.example.com
 
 which passes `PRODUCTION_HOST=prod.example.com` to stage commands.
 
-The `*_AGENT_COMMAND` variables are plain shell commands. They may launch Codex,
-Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other executable
-workflow. The orchestrator starts a fresh subprocess for each stage and passes a
-fresh `ORCHESTRATOR_SUBAGENT_ID` plus the stage role through the environment.
+The `PATBTAWO_*_RUN_COMMAND` variables are plain shell commands. They may launch
+Codex, Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other
+executable workflow. The orchestrator starts a fresh subprocess for each stage
+and passes a fresh `ORCHESTRATOR_SUBAGENT_ID` plus the stage role through the
+environment.
 
-Do not leave the backward-compatible aliases pointed at placeholder scripts such
-as `python scripts/builder.py` unless those files exist in the target repository.
-`python -m patbtawo --validate-config` checks obvious local path references before
-any task is moved, so a missing stage script fails fast instead of sending every
-Ready task to Failed.
+Do not point the backward-compatible aliases at placeholder scripts such as
+`python scripts/builder.py` unless those files exist in the target repository.
+The packaged adapters avoid that failure mode by living inside the installed
+PATBTAWO package.
 
 ## Providers
 
