@@ -755,6 +755,8 @@ class ConfigTests(unittest.TestCase):
                 "ORCHESTRATOR_STAGE_ENV_KEYS": "PRODUCTION_HOST",
                 "PRODUCTION_HOST": "app.example.com",
                 "ORCHESTRATOR_STAGE_ENV_DEPLOY_PORT": "22",
+                "PATBTAWO_BUILDER_RUN_COMMAND": "codex exec task",
+                "PATBTAWO_VERIFIER_RUN_COMMAND": "python -m unittest",
             }
 
             config = orchestrator.OrchestratorConfig.from_env(env, cwd=repo)
@@ -763,6 +765,8 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.stage_environment["ORCHESTRATOR_DEPLOY_USER"], "deploy")
             self.assertEqual(config.stage_environment["PRODUCTION_HOST"], "app.example.com")
             self.assertEqual(config.stage_environment["DEPLOY_PORT"], "22")
+            self.assertEqual(config.stage_environment["PATBTAWO_BUILDER_RUN_COMMAND"], "codex exec task")
+            self.assertEqual(config.stage_environment["PATBTAWO_VERIFIER_RUN_COMMAND"], "python -m unittest")
             self.assertNotIn("ASANA_ACCESS_TOKEN", config.stage_environment)
 
     def test_validate_runtime_config_rejects_missing_stage_script(self) -> None:

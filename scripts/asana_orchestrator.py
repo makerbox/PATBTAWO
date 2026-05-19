@@ -70,6 +70,14 @@ RESERVED_DEPLOY_ENV_KEYS = {
     "ORCHESTRATOR_DEPLOYER_AGENT_COMMAND",
     "ORCHESTRATOR_SMOKE_COMMAND",
 }
+PATBTAWO_RUN_COMMAND_KEYS = {
+    "PATBTAWO_BUILDER_RUN_COMMAND",
+    "PATBTAWO_BUILD_RUN_COMMAND",
+    "PATBTAWO_VERIFIER_RUN_COMMAND",
+    "PATBTAWO_VERIFY_RUN_COMMAND",
+    "PATBTAWO_DEPLOY_RUN_COMMAND",
+    "PATBTAWO_SMOKE_RUN_COMMAND",
+}
 
 
 class ConfigError(RuntimeError):
@@ -413,6 +421,8 @@ def stage_environment_from_env(environ: Mapping[str, str]) -> Dict[str, str]:
                 break
         else:
             if key.startswith(DEPLOY_ENV_PREFIXES) and key not in RESERVED_DEPLOY_ENV_KEYS:
+                stage_env[key] = value
+            elif key in PATBTAWO_RUN_COMMAND_KEYS:
                 stage_env[key] = value
 
     return stage_env
