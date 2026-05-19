@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "patbtawo"
+version = "0.1.0"
+description = "PATBTAWO: provider-agnostic task-board-to-agent workflow orchestrator for Asana, Trello, ClickUp, Jira, monday.com, and custom systems."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Codex"}]
+keywords = ["asana", "trello", "clickup", "jira", "monday", "orchestration", "workflow"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.scripts]
+task-orchestrator = "task_workflow_orchestrator.cli:main"
+patbtawo = "task_workflow_orchestrator.cli:main"
+asana-orchestrator = "task_workflow_orchestrator.cli:main"
+
+[tool.setuptools]
+packages = ["scripts", "task_workflow_orchestrator"]
