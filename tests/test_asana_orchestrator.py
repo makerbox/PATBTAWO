@@ -147,6 +147,22 @@ print("hello from stage")
             self.assertIn("missing report file", "\n".join(outcome.report["failures"]))
 
 
+class CommentFormattingTests(unittest.TestCase):
+    def test_human_comment_intro_precedes_structured_payload(self) -> None:
+        lines = orchestrator.human_comment_intro(
+            status="failed",
+            stage="verifier",
+            attempt="1/2",
+            summary="Tests failed.",
+            next_action="Fix the failing test.",
+        )
+
+        self.assertEqual(lines[0], "PATBTAWO could not complete this task.")
+        self.assertIn("Stage: verifier. Attempt: 1/2.", lines)
+        self.assertIn("Summary: Tests failed.", lines)
+        self.assertIn("Next: Fix the failing test.", lines)
+
+
 class WorktreeIsolationTests(unittest.TestCase):
     def test_checkpoint_can_seed_fresh_verifier_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

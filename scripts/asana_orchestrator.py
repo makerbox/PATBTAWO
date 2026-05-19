@@ -1556,6 +1556,34 @@ def tracked_changed_files(worktree_path: Path) -> List[str]:
     return sorted(set(changed))
 
 
+def human_comment_intro(
+    *,
+    status: str,
+    stage: str,
+    attempt: str,
+    summary: str,
+    next_action: str,
+) -> List[str]:
+    status_labels = {
+        "done": "PATBTAWO finished this task successfully.",
+        "failed": "PATBTAWO could not complete this task.",
+        "blocked": "PATBTAWO found an external blocker.",
+        "retrying": "PATBTAWO hit a retryable issue and will try again.",
+        "handoff": "PATBTAWO completed this stage and is moving to the next one.",
+        "resumed": "PATBTAWO resumed an interrupted run.",
+    }
+    headline = status_labels.get(status, f"PATBTAWO update: {status}.")
+    lines = [
+        headline,
+        f"Stage: {stage}. Attempt: {attempt}.",
+    ]
+    if summary:
+        lines.append(f"Summary: {summary[:500]}")
+    if next_action:
+        lines.append(f"Next: {next_action[:500]}")
+    return lines
+
+
 class TaskOrchestrator:
     def __init__(self, config: OrchestratorConfig, provider: Any) -> None:
         self.config = config
@@ -1855,7 +1883,16 @@ class TaskOrchestrator:
         next_action: str,
         artifacts: Optional[Sequence[str]] = None,
     ) -> None:
+        human_lines = human_comment_intro(
+            status=status,
+            stage=stage,
+            attempt=attempt,
+            summary=summary,
+            next_action=next_action,
+        )
         lines = [
+            *human_lines,
+            "",
             "[orchestrator]",
             f"status: {status}",
             f"stage: {stage}",
