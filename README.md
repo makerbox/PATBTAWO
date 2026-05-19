@@ -25,17 +25,36 @@ the builder checkpoint instead of inheriting the builder's runtime context.
   LangGraph, a shell script, or a CI wrapper. Each stage command must write the
   required JSON report to `ORCHESTRATOR_REPORT_PATH`.
 
-Install locally:
+You can run PATBTAWO directly from a checkout without installing it:
+
+```sh
+python -m patbtawo --help
+```
+
+That is the safest path on Windows because it avoids generated console-command
+launcher `.exe` files, which can trigger antivirus scans even when clean.
+
+Optional local install:
 
 ```sh
 python -m pip install .
 ```
 
+The package intentionally does not install console scripts; use
+`python -m patbtawo` after installation too.
+
+If you installed an older version that created `patbtawo.exe`,
+`task-orchestrator.exe`, or `asana-orchestrator.exe`, remove those launchers with:
+
+```sh
+python -m pip uninstall patbtawo
+```
+
 Run from inside the git repository that should receive fresh per-task worktrees:
 
 ```sh
-patbtawo --validate-config --print-config
-patbtawo --once
+python -m patbtawo --validate-config --print-config
+python -m patbtawo --once
 ```
 
 Configuration and provider setup are documented in

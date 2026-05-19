@@ -230,6 +230,16 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(environ["A"], "existing")
             self.assertEqual(environ["B"], "quoted")
 
+    def test_configuration_help_mentions_provider_and_module_command(self) -> None:
+        message = orchestrator.configuration_help(
+            "asana",
+            orchestrator.MissingConfigError("Missing required configuration: ASANA_ACCESS_TOKEN"),
+        )
+
+        self.assertIn("Selected provider: asana", message)
+        self.assertIn("ASANA_ACCESS_TOKEN", message)
+        self.assertIn("python -m patbtawo --validate-config --print-config", message)
+
     def test_ensure_under_rejects_root_and_outside_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "root"

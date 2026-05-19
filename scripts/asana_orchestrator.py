@@ -49,6 +49,10 @@ class ConfigError(RuntimeError):
     """Raised when required local configuration is missing or invalid."""
 
 
+class MissingConfigError(ConfigError):
+    """Raised when required environment configuration is missing."""
+
+
 class CommandError(RuntimeError):
     """Raised when a local command cannot be completed."""
 
@@ -338,7 +342,7 @@ def normalize_provider_name(value: Optional[str]) -> str:
 def required_env(environ: Mapping[str, str], names: Sequence[str]) -> Dict[str, str]:
     missing = [name for name in names if not environ.get(name)]
     if missing:
-        raise ConfigError("Missing required configuration: " + ", ".join(missing))
+        raise MissingConfigError("Missing required configuration: " + ", ".join(missing))
     return {name: environ[name] for name in names}
 
 
@@ -348,7 +352,7 @@ def first_env(environ: Mapping[str, str], names: Sequence[str], *, required: boo
         if value:
             return value
     if required:
-        raise ConfigError("Missing required configuration: " + " or ".join(names))
+        raise MissingConfigError("Missing required configuration: " + " or ".join(names))
     return ""
 
 
@@ -447,6 +451,39 @@ def redact_secrets(payload: Mapping[str, str]) -> Dict[str, str]:
     for key, value in payload.items():
         redacted[key] = "***" if any(marker in key.upper() for marker in secret_markers) else value
     return redacted
+
+
+def configuration_help(provider_name: str, error: Exception) -> str:
+    lines = [
+        str(error),
+        "",
+        f"Selected provider: {provider_name}",
+    ]
+    if provider_name == "asana":
+        lines.extend(
+            [
+                "Asana requires ASANA_ACCESS_TOKEN, ASANA_PROJECT_GID, seven section IDs, and builder/verifier commands.",
+                "Set ORCHESTRATOR_PROVIDER=asana or pass --provider asana explicitly.",
+            ]
+        )
+    elif provider_name == "trello":
+        lines.append("Trello requires TRELLO_API_KEY, TRELLO_TOKEN, list IDs, and builder/verifier commands.")
+    elif provider_name == "clickup":
+        lines.append("ClickUp requires CLICKUP_ACCESS_TOKEN, CLICKUP_LIST_ID, status names, and builder/verifier commands.")
+    elif provider_name == "jira":
+        lines.append("Jira requires JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, Ready query/project config, transitions/statuses, and builder/verifier commands.")
+    elif provider_name == "monday":
+        lines.append("monday.com requires MONDAY_API_TOKEN, MONDAY_BOARD_ID, MONDAY_STATUS_COLUMN_ID, status labels, and builder/verifier commands.")
+    elif provider_name == "command":
+        lines.append("The command provider requires the four ORCHESTRATOR_COMMAND_* hooks, lifecycle states, and builder/verifier commands.")
+    lines.extend(
+        [
+            "Copy .env.example to .env, fill in the values for your provider, then rerun:",
+            "  python -m patbtawo --validate-config --print-config",
+            "Use --provider trello|clickup|jira|monday|asana|command if you do not want the default Asana provider.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 class AsanaClient:
@@ -1979,6 +2016,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif Path(".env").exists():
         load_env_file(Path(".env"), environ)
 
+    provider_name = normalize_provider_name(args.provider or environ.get("ORCHESTRATOR_PROVIDER"))
     try:
         config = OrchestratorConfig.from_env(
             environ,
@@ -1994,6 +2032,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         provider = build_provider(config)
         TaskOrchestrator(config, provider).run(once=bool(args.once))
         return 0
+    except MissingConfigError as exc:
+        print(f"Configuration error: {configuration_help(provider_name, exc)}", file=sys.stderr)
+        return 2
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2

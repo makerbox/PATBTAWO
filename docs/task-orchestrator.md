@@ -30,7 +30,16 @@ Provider adapters were aligned to these official API surfaces:
 
 ## Install
 
-From this repository:
+From this repository, you can run PATBTAWO without installing it:
+
+```sh
+python -m patbtawo --help
+```
+
+That is the safest path on Windows because it avoids generated console-command
+launcher `.exe` files, which can trigger antivirus scans even when clean.
+
+Optional local install:
 
 ```sh
 python -m pip install .
@@ -42,16 +51,15 @@ For editable local development:
 python -m pip install -e .
 ```
 
-The install exposes two console commands:
+The package intentionally does not install console scripts. Use
+`python -m patbtawo` after installation too.
+
+If you installed an older version that created `patbtawo.exe`,
+`task-orchestrator.exe`, or `asana-orchestrator.exe`, remove those launchers with:
 
 ```sh
-patbtawo --help
-task-orchestrator --help
-asana-orchestrator --help
+python -m pip uninstall patbtawo
 ```
-
-`task-orchestrator` and `asana-orchestrator` are compatibility aliases; new
-setups should use `patbtawo`.
 
 ## Lifecycle
 
@@ -243,19 +251,19 @@ ORCHESTRATOR_COMMAND_COMMENT_TASK=./provider-comment
 Validate configuration from inside the git repository:
 
 ```sh
-patbtawo --validate-config --print-config
+python -m patbtawo --validate-config --print-config
 ```
 
 Process a single task:
 
 ```sh
-patbtawo --once
+python -m patbtawo --once
 ```
 
 Process until Ready is empty:
 
 ```sh
-patbtawo
+python -m patbtawo
 ```
 
 Use `--dry-run` or `ORCHESTRATOR_DRY_RUN=true` to skip provider moves/comments
