@@ -123,11 +123,16 @@ PATBTAWO_SMOKE_RUN_COMMAND=
 Example builder run command:
 
 ```sh
-PATBTAWO_BUILDER_RUN_COMMAND=codex --ask-for-approval never exec --sandbox workspace-write "Read ORCHESTRATOR_TASK_CONTRACT_PATH, implement the task in this worktree, run relevant checks, and do not commit."
+PATBTAWO_BUILDER_RUN_COMMAND=codex --ask-for-approval never exec --sandbox workspace-write "Read the task contract at ${ORCHESTRATOR_TASK_CONTRACT_PATH}. Implement the requested change in this worktree. Keep edits scoped, run relevant checks, and do not commit."
 ```
 
 For Codex CLI, keep global CLI flags such as `--ask-for-approval` before the
 `exec` subcommand.
+
+PATBTAWO expands `${VAR}`, `$VAR`, and `%VAR%` in stage command strings before
+launching the platform shell. Prefer `${VAR}` in shared examples because the
+same `.env` command then works on Windows, macOS, and Linux for paths such as
+`${ORCHESTRATOR_TASK_CONTRACT_PATH}`.
 
 Provider-specific aliases are supported. For example, Asana can use
 `ASANA_SECTION_READY_GID`, Trello can use `TRELLO_LIST_READY_ID`, ClickUp can use
@@ -207,6 +212,11 @@ Codex, Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other
 executable workflow. The orchestrator starts a fresh subprocess for each stage
 and passes a fresh `ORCHESTRATOR_SUBAGENT_ID` plus the stage role through the
 environment.
+
+Keep command bodies as portable as the tool allows: prefer `python -m ...` over
+shell-specific wrappers, avoid PowerShell/Bash-only syntax in shared examples,
+and put platform-specific setup behind scripts when a deploy target truly needs
+it.
 
 Do not point the backward-compatible aliases at placeholder scripts such as
 `python scripts/builder.py` unless those files exist in the target repository.

@@ -82,6 +82,11 @@ PATBTAWO_RUN_COMMAND_KEYS = {
 }
 PROCESS_ENCODING = "utf-8"
 PROCESS_ERRORS = "replace"
+ENV_REFERENCE_PATTERN = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
+    r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+    r"|%([A-Za-z_][A-Za-z0-9_]*)%"
+)
 
 
 class ConfigError(RuntimeError):
@@ -465,6 +470,14 @@ def stage_environment_from_env(environ: Mapping[str, str]) -> Dict[str, str]:
     return stage_env
 
 
+def expand_command_env(command: str, environ: Mapping[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2) or match.group(3) or ""
+        return str(environ.get(name, match.group(0)))
+
+    return ENV_REFERENCE_PATTERN.sub(replace, command)
+
+
 def command_tokens(command: str) -> List[str]:
     try:
         tokens = shlex.split(command, posix=os.name != "nt")
@@ -496,7 +509,8 @@ def is_local_path_token(token: str) -> bool:
 def referenced_local_paths(command: str, repo_root: Path) -> List[Tuple[str, Path]]:
     paths: List[Tuple[str, Path]] = []
     seen: set[str] = set()
-    for token in command_tokens(command):
+    expanded_command = expand_command_env(command, os.environ)
+    for token in command_tokens(expanded_command):
         if not is_local_path_token(token):
             continue
         raw_path = Path(os.path.expanduser(os.path.expandvars(token)))
@@ -1525,8 +1539,9 @@ class CommandProvider:
     def _run_text(command: str, extra_env: Mapping[str, str]) -> str:
         env = os.environ.copy()
         env.update(extra_env)
+        expanded_command = expand_command_env(command, env)
         completed = subprocess.run(
-            command,
+            expanded_command,
             shell=True,
             text=True,
             encoding=PROCESS_ENCODING,
@@ -1779,9 +1794,10 @@ class StageRunner:
         output = ""
         exit_code: Optional[int] = None
         timed_out = False
+        expanded_command = expand_command_env(command, env)
         try:
             completed = subprocess.run(
-                command,
+                expanded_command,
                 cwd=str(worktree_path),
                 env=env,
                 shell=True,

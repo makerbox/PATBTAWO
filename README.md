@@ -7,7 +7,8 @@ Each task attempt runs isolated builder, verifier, and deployer stages; with
 objective verification enabled, the verifier gets a fresh worktree derived from
 the builder checkpoint instead of inheriting the builder's runtime context.
 The Ready queue is consumed top-down using provider-native list, view, position,
-or rank order where the provider exposes it.
+or rank order where the provider exposes it. The core runner is written to work
+on Windows, macOS, and Linux.
 
 ## Prerequisites
 
@@ -69,6 +70,9 @@ as Failed or Blocked.
 Before starting a real board run, keep the packaged stage adapter commands in
 `.env` and set `PATBTAWO_BUILDER_RUN_COMMAND` to the coding agent or script that
 should perform task work. The adapters write the required JSON reports for you.
+PATBTAWO expands `${VAR}`, `$VAR`, and `%VAR%` inside stage commands before
+launching the platform shell, so command templates can usually stay the same
+across Windows, macOS, and Linux.
 
 Deployment is opt-in. Set `ORCHESTRATOR_DEPLOY_ENABLED=true`, set
 `PATBTAWO_DEPLOY_RUN_COMMAND`, and pass target details such as

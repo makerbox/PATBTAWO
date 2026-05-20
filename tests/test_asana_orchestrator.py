@@ -171,6 +171,49 @@ with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
             self.assertTrue(outcome.succeeded)
             self.assertEqual(outcome.summary, "prod.example.com")
 
+    def test_stage_runner_expands_posix_and_windows_env_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            writer = tmp_path / "writer.py"
+            writer.write_text(
+                """
+import json
+import os
+import sys
+
+expected = os.environ["ORCHESTRATOR_TASK_CONTRACT_PATH"]
+passed = sys.argv[1:]
+report = {
+    "task_id": os.environ["ORCHESTRATOR_TASK_ID"],
+    "status": "success" if passed == [expected, expected] else "failed",
+    "summary": "|".join(passed),
+    "changed_files": [],
+    "checks": [{"name": "env expansion", "status": "passed" if passed == [expected, expected] else "failed"}],
+    "failures": [] if passed == [expected, expected] else [repr(passed), expected],
+    "next_action": "continue",
+    "artifact_paths": [],
+}
+with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+sys.exit(0 if passed == [expected, expected] else 1)
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            runner = orchestrator.StageRunner(make_config(tmp_path))
+            outcome = runner.run(
+                stage="builder",
+                command=f'"{sys.executable}" "{writer}" "${{ORCHESTRATOR_TASK_CONTRACT_PATH}}" "%ORCHESTRATOR_TASK_CONTRACT_PATH%"',
+                task_contract={"gid": "123", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            self.assertTrue(outcome.succeeded, outcome.report)
+
     def test_stage_runner_synthesizes_failure_when_report_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -365,6 +408,42 @@ class BuiltinStageAdapterTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stdout)
             self.assertEqual(report["status"], "success")
             self.assertIn("agent output:", completed.stdout)
+
+    def test_packaged_builder_expands_cross_platform_env_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            checker = tmp_path / "checker.py"
+            checker.write_text(
+                """
+import os
+import sys
+
+expected = os.environ["ORCHESTRATOR_TASK_CONTRACT_PATH"]
+sys.exit(0 if sys.argv[1:] == [expected, expected] else 1)
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env = self.stage_env(tmp_path, stage="builder")
+            env["ORCHESTRATOR_TASK_CONTRACT_PATH"] = str(tmp_path / "task_contract.json")
+            env["PATBTAWO_BUILDER_RUN_COMMAND"] = (
+                f'"{sys.executable}" "{checker}" '
+                '"${ORCHESTRATOR_TASK_CONTRACT_PATH}" "%ORCHESTRATOR_TASK_CONTRACT_PATH%"'
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.builder"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(report["status"], "success")
 
     def test_packaged_verifier_autodetects_unittest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

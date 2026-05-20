@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -22,6 +23,11 @@ SUCCESS_STATUSES = {"success", "passed"}
 TRANSIENT_EXIT_CODES = {75}
 PROCESS_ENCODING = "utf-8"
 PROCESS_ERRORS = "replace"
+ENV_REFERENCE_PATTERN = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}"
+    r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+    r"|%([A-Za-z_][A-Za-z0-9_]*)%"
+)
 
 
 def utc_now() -> str:
@@ -140,6 +146,14 @@ def command_from_env(names: Sequence[str]) -> str:
     return ""
 
 
+def expand_command_env(command: str, environ: Mapping[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2) or match.group(3) or ""
+        return str(environ.get(name, match.group(0)))
+
+    return ENV_REFERENCE_PATTERN.sub(replace, command)
+
+
 def write_stdout(text: str) -> None:
     try:
         sys.stdout.write(text)
@@ -153,8 +167,9 @@ def run_shell(command: str, *, log_name: str) -> Dict[str, Any]:
     artifact_dir().mkdir(parents=True, exist_ok=True)
     log_path = artifact_dir() / log_name
     started = time.monotonic()
+    expanded_command = expand_command_env(command, os.environ)
     completed = subprocess.run(
-        command,
+        expanded_command,
         shell=True,
         text=True,
         encoding=PROCESS_ENCODING,
