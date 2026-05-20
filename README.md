@@ -23,8 +23,11 @@ or rank order where the provider exposes it.
   [ClickUp personal token](https://developer.clickup.com/docs/authentication),
   [Jira API token](https://support.atlassian.com/atlassian-account/docs/manage-api-tokens-for-your-atlassian-account/),
   or [monday.com API token](https://developer.monday.com/api-reference/docs/authentication).
-- A builder run command for the packaged builder adapter, such as Codex, Claude
-  Code, BMAD, LangGraph, a shell script, or a CI wrapper.
+- An AI coding agent, automation script, or CI wrapper that can run from the
+  command line without interactive prompts. For an agent such as Codex CLI,
+  Claude Code, BMAD, or LangGraph, install it, authenticate it locally, and make
+  sure it can edit a fresh git worktree before assigning it to
+  `PATBTAWO_BUILDER_RUN_COMMAND`.
 
 You can run PATBTAWO directly from a checkout without installing it:
 
