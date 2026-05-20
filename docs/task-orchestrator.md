@@ -79,13 +79,15 @@ The orchestrator processes exactly one Ready task at a time:
 12. Fail verification if the verifier modifies tracked files.
 13. If deploy is enabled, create a fresh deployer worktree from the verified
     checkpoint, move the task to Deploying, and run deploy/smoke.
-14. Move successful tasks to Done.
-15. Move failed tasks to Failed.
-16. Move externally blocked tasks to Blocked.
-17. Comment concise status back to the provider.
-18. Retry retryable/transient stage failures with a fresh worktree until the
+14. Fast-forward merge successful task changes back into `ORCHESTRATOR_BASE_BRANCH`.
+15. Delete the temporary attempt branches after their worktrees are removed.
+16. Move successful tasks to Done.
+17. Move failed tasks to Failed.
+18. Move externally blocked tasks to Blocked.
+19. Comment concise status back to the provider.
+20. Retry retryable/transient stage failures with a fresh worktree until the
     retry limit is exhausted.
-19. Continue until the Ready queue is empty.
+21. Continue until the Ready queue is empty.
 
 The Ready queue is consumed top-down. PATBTAWO uses each provider's native
 list, view, position, or rank order where it is available, such as Trello `pos`,
@@ -114,6 +116,7 @@ ORCHESTRATOR_BUILDER_AGENT_COMMAND=python -m patbtawo.builder
 ORCHESTRATOR_VERIFIER_AGENT_COMMAND=python -m patbtawo.verifier
 ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python -m patbtawo.deployer
 ORCHESTRATOR_SMOKE_COMMAND=python -m patbtawo.smoke
+ORCHESTRATOR_MODEL=gpt-5.4-mini
 PATBTAWO_BUILDER_RUN_COMMAND=
 PATBTAWO_VERIFIER_RUN_COMMAND=
 PATBTAWO_DEPLOY_RUN_COMMAND=
@@ -123,7 +126,7 @@ PATBTAWO_SMOKE_RUN_COMMAND=
 Example builder run command:
 
 ```sh
-PATBTAWO_BUILDER_RUN_COMMAND=codex --ask-for-approval never exec --sandbox workspace-write "Read the task contract at ${ORCHESTRATOR_TASK_CONTRACT_PATH}. Implement the requested change in this worktree. Keep edits scoped, run relevant checks, and do not commit."
+PATBTAWO_BUILDER_RUN_COMMAND=codex -m "${ORCHESTRATOR_MODEL}" --ask-for-approval never exec --sandbox workspace-write "Read the task contract at ${ORCHESTRATOR_TASK_CONTRACT_PATH}. Implement the requested change in this worktree. Keep edits scoped, run relevant checks, and do not commit."
 ```
 
 For Codex CLI, keep global CLI flags such as `--ask-for-approval` before the
@@ -157,6 +160,7 @@ Optional local behavior:
 - `ORCHESTRATOR_VERIFIER_COMMAND`, backward-compatible alias
 - `ORCHESTRATOR_DEPLOY_COMMAND`
 - `ORCHESTRATOR_SMOKE_COMMAND`
+- `ORCHESTRATOR_MODEL`
 - `PATBTAWO_BUILDER_RUN_COMMAND`
 - `PATBTAWO_VERIFIER_RUN_COMMAND`
 - `PATBTAWO_DEPLOY_RUN_COMMAND`
@@ -447,8 +451,9 @@ Each stage gets:
 - `task_contract.json`
 
 Worktrees are removed after terminal success, failure, or blocker unless
-`ORCHESTRATOR_KEEP_WORKTREES=true`. Attempt branches are left in git so a builder
-that committed useful work does not lose it during cleanup.
+`ORCHESTRATOR_KEEP_WORKTREES=true`. Successful attempts are fast-forward merged
+back into `ORCHESTRATOR_BASE_BRANCH` before the task is marked Done, and
+temporary attempt branches are deleted during cleanup.
 
 With objective verification enabled, each attempt can create up to three
 worktrees: builder, verifier, and deployer. The verifier and deployer worktrees

@@ -455,6 +455,9 @@ def stage_environment_from_env(environ: Mapping[str, str]) -> Dict[str, str]:
     for key, value in environ.items():
         if key == STAGE_ENV_KEY_LIST:
             continue
+        if key == "ORCHESTRATOR_MODEL":
+            stage_env[key] = value
+            continue
         for prefix in STAGE_ENV_PREFIXES:
             if key.startswith(prefix):
                 target = key.removeprefix(prefix)
@@ -1659,6 +1662,9 @@ class WorktreeManager:
     def __init__(self, config: OrchestratorConfig) -> None:
         self.config = config
 
+    def branch_for_path(self, path: Path) -> str:
+        return f"orchestrator/{path.name}"
+
     def create(self, task_id: str, attempt: int, *, stage: str = "stage", base_ref: Optional[str] = None) -> Tuple[Path, str]:
         safe_task = slug(task_id)
         safe_stage = slug(stage)
@@ -1673,6 +1679,9 @@ class WorktreeManager:
             cwd=self.config.repo_root,
         )
         return path.resolve(), branch
+
+    def current_commit(self, worktree_path: Path) -> str:
+        return run_local(["git", "rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
 
     def checkpoint(self, worktree_path: Path, *, task_id: str, attempt: int, stage: str) -> str:
         status = run_local(["git", "status", "--porcelain"], cwd=worktree_path).stdout.strip()
@@ -1692,7 +1701,19 @@ class WorktreeManager:
                 ],
                 cwd=worktree_path,
             )
-        return run_local(["git", "rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+        return self.current_commit(worktree_path)
+
+    def merge_into_base(self, ref: str) -> None:
+        if self.config.base_branch == "HEAD":
+            raise ConfigError(
+                "ORCHESTRATOR_BASE_BRANCH resolved to HEAD, so PATBTAWO cannot merge task changes back "
+                "into a named base branch. Set ORCHESTRATOR_BASE_BRANCH to a branch such as main."
+            )
+        current = run_local(["git", "branch", "--show-current"], cwd=self.config.repo_root, check=False).stdout.strip()
+        if current != self.config.base_branch:
+            run_local(["git", "switch", self.config.base_branch], cwd=self.config.repo_root)
+        print(f"Fast-forward merging {ref} into {self.config.base_branch}")
+        run_local(["git", "merge", "--ff-only", ref], cwd=self.config.repo_root)
 
     def remove(self, path: Path) -> None:
         ensure_under(path, self.config.worktree_root)
@@ -1700,6 +1721,7 @@ class WorktreeManager:
             print(f"Keeping worktree due to ORCHESTRATOR_KEEP_WORKTREES: {path}")
             return
         if not path.exists():
+            self._delete_branch(self.branch_for_path(path))
             return
         print(f"Removing worktree {path}")
         run_local(["git", "worktree", "remove", "--force", str(path)], cwd=self.config.repo_root, check=False)
@@ -1712,6 +1734,13 @@ class WorktreeManager:
                     "PATBTAWO will continue with a fresh worktree."
                 )
         run_local(["git", "worktree", "prune"], cwd=self.config.repo_root, check=False)
+        self._delete_branch(self.branch_for_path(path))
+
+    def _delete_branch(self, branch: str) -> None:
+        if not branch:
+            return
+        print(f"Deleting branch {branch}")
+        run_local(["git", "branch", "-D", branch], cwd=self.config.repo_root, check=False)
 
 
 @dataclasses.dataclass
@@ -2354,11 +2383,13 @@ class TaskOrchestrator:
                 self.state.record_stage("deployer", deploy)
                 if not deploy.succeeded:
                     return deploy
+                self.worktrees.merge_into_base(self.worktrees.current_commit(worktree_path))
                 self._move(task_id, "done")
                 self._comment_outcome(task_id, deploy, attempt, self.config.retry_limit + 1, terminal="done")
                 deploy.status = "success"
                 return deploy
 
+            self.worktrees.merge_into_base(self.worktrees.current_commit(worktree_path))
             self._move(task_id, "done")
             self._comment_outcome(task_id, verify, attempt, self.config.retry_limit + 1, terminal="done")
             verify.status = "success"

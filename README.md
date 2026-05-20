@@ -7,8 +7,10 @@ Each task attempt runs isolated builder, verifier, and deployer stages; with
 objective verification enabled, the verifier gets a fresh worktree derived from
 the builder checkpoint instead of inheriting the builder's runtime context.
 The Ready queue is consumed top-down using provider-native list, view, position,
-or rank order where the provider exposes it. The core runner is written to work
-on Windows, macOS, and Linux.
+or rank order where the provider exposes it. When a task finishes successfully,
+its changes are fast-forward merged back into the base branch before the next
+task starts, and the temporary attempt branches are deleted. The core runner is
+written to work on Windows, macOS, and Linux.
 
 ## Prerequisites
 
@@ -73,6 +75,10 @@ should perform task work. The adapters write the required JSON reports for you.
 PATBTAWO expands `${VAR}`, `$VAR`, and `%VAR%` inside stage commands before
 launching the platform shell, so command templates can usually stay the same
 across Windows, macOS, and Linux.
+
+If you are using a coding agent such as Codex CLI, set `ORCHESTRATOR_MODEL`
+and reference it from `PATBTAWO_BUILDER_RUN_COMMAND` so you can switch models
+without rewriting the whole command string.
 
 Deployment is opt-in. Set `ORCHESTRATOR_DEPLOY_ENABLED=true`, set
 `PATBTAWO_DEPLOY_RUN_COMMAND`, and pass target details such as

@@ -82,6 +82,15 @@ class ReportValidationTests(unittest.TestCase):
         self.assertEqual(orchestrator.normalize_status("wat"), "unknown")
 
 
+class StageEnvironmentTests(unittest.TestCase):
+    def test_stage_environment_includes_orchestrator_model(self) -> None:
+        env = {"ORCHESTRATOR_MODEL": "gpt-5.4-mini"}
+
+        stage_env = orchestrator.stage_environment_from_env(env)
+
+        self.assertEqual(stage_env["ORCHESTRATOR_MODEL"], "gpt-5.4-mini")
+
+
 class StageRunnerTests(unittest.TestCase):
     def test_stage_runner_accepts_valid_command_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -932,6 +941,49 @@ class WorktreeIsolationTests(unittest.TestCase):
 
             manager.remove(verifier_path)
             manager.remove(builder_path)
+
+    def test_merge_into_base_and_remove_cleans_up_attempt_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            config = dataclasses.replace(make_config(tmp_path), repo_root=repo, base_branch="main")
+            manager = orchestrator.WorktreeManager(config)
+
+            builder_path, branch = manager.create("TASK-1", 1, stage="builder")
+            (builder_path / "feature.txt").write_text("built\n", encoding="utf-8")
+            ref = manager.checkpoint(builder_path, task_id="TASK-1", attempt=1, stage="builder")
+
+            manager.merge_into_base(ref)
+            self.assertEqual((repo / "feature.txt").read_text(encoding="utf-8"), "built\n")
+
+            manager.remove(builder_path)
+            branch_check = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            self.assertNotEqual(branch_check.returncode, 0)
 
 
 class ConfigTests(unittest.TestCase):
