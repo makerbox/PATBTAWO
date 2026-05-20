@@ -216,10 +216,99 @@ with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
             self.assertIn("stage output:", failures)
             self.assertIn("missing report file", failures)
 
+    def test_stage_runner_preserves_valid_failed_report_with_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            writer = tmp_path / "writer.py"
+            writer.write_text(
+                """
+import json
+import os
+import sys
+
+report = {
+    "task_id": os.environ["ORCHESTRATOR_TASK_ID"],
+    "status": "failed",
+    "summary": "Tests failed because one assertion failed.",
+    "changed_files": [],
+    "checks": [{"name": "unit", "status": "failed"}],
+    "failures": ["expected blocked, got failed"],
+    "next_action": "Fix the failing assertion.",
+    "artifact_paths": [],
+}
+with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+sys.exit(1)
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            runner = orchestrator.StageRunner(make_config(tmp_path))
+            outcome = runner.run(
+                stage="verifier",
+                command=f'"{sys.executable}" "{writer}"',
+                task_contract={"gid": "456", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertEqual(outcome.summary, "Tests failed because one assertion failed.")
+            self.assertIn("expected blocked, got failed", outcome.report["failures"])
+            self.assertNotIn("did not produce a valid passing report", outcome.summary)
+
+    def test_stage_runner_preserves_valid_blocked_report_with_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            writer = tmp_path / "writer.py"
+            writer.write_text(
+                """
+import json
+import os
+import sys
+
+report = {
+    "task_id": os.environ["ORCHESTRATOR_TASK_ID"],
+    "status": "blocked",
+    "summary": "Builder is not configured.",
+    "changed_files": [],
+    "checks": [],
+    "failures": ["missing builder command"],
+    "next_action": "Configure the builder command.",
+    "artifact_paths": [],
+}
+with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+sys.exit(1)
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            runner = orchestrator.StageRunner(make_config(tmp_path))
+            outcome = runner.run(
+                stage="builder",
+                command=f'"{sys.executable}" "{writer}"',
+                task_contract={"gid": "456", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            self.assertEqual(outcome.status, "blocked")
+            self.assertTrue(outcome.blocked)
+            self.assertEqual(outcome.summary, "Builder is not configured.")
+
 
 class BuiltinStageAdapterTests(unittest.TestCase):
     def stage_env(self, tmp_path: Path, *, stage: str, task_id: str = "TASK-1") -> dict[str, str]:
         env = dict(os.environ)
+        for key in orchestrator.PATBTAWO_RUN_COMMAND_KEYS:
+            env.pop(key, None)
         env["PYTHONPATH"] = str(ROOT)
         env["ORCHESTRATOR_STAGE"] = stage
         env["ORCHESTRATOR_TASK_ID"] = task_id
@@ -232,7 +321,8 @@ class BuiltinStageAdapterTests(unittest.TestCase):
     def test_packaged_builder_writes_blocked_report_without_inner_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            env = self.stage_env(tmp_path, stage="builder")
+            with mock.patch.dict(os.environ, {"PATBTAWO_BUILDER_RUN_COMMAND": "echo leaked"}, clear=False):
+                env = self.stage_env(tmp_path, stage="builder")
 
             completed = subprocess.run(
                 [sys.executable, "-m", "patbtawo.builder"],

@@ -1804,18 +1804,19 @@ class StageRunner:
 
         report, load_failures = self._load_stage_report(report_path, task_id)
         validation_failures = validate_report(report, task_id) if report else load_failures
+        report_status = normalize_status(report.get("status")) if report else "unknown"
 
         command_failed = exit_code not in (0, None)
         if timed_out:
             validation_failures.insert(0, "stage command timed out")
-        if command_failed:
+        if command_failed and report_status not in {"failed", "blocked"}:
             validation_failures.insert(0, f"stage command exited with code {exit_code}")
         tail = output_tail(output)
         if tail and validation_failures:
             validation_failures.insert(1 if command_failed else 0, f"stage output: {tail}")
-        if exit_code not in (0, None) and normalize_status(report.get("status")) == "success":
+        if exit_code not in (0, None) and report_status == "success":
             validation_failures.append("stage command exited non-zero while report status was success")
-        if exit_code == 0 and normalize_status(report.get("status")) == "unknown":
+        if exit_code == 0 and report_status == "unknown":
             validation_failures.append("stage report status is not recognized")
 
         if validation_failures:
@@ -1844,10 +1845,15 @@ class StageRunner:
                 exit_code=exit_code,
             )
 
-        status = normalize_status(report.get("status"))
+        status = report_status
         retryable = bool(report.get("retryable") or report.get("transient") or exit_code in TRANSIENT_EXIT_CODES)
         if command_failed and status != "blocked":
             status = "failed"
+            report["status"] = "failed"
+        if command_failed:
+            failures = report.get("failures")
+            if isinstance(failures, list) and not failures:
+                failures.append(f"stage command exited with code {exit_code}")
         report.setdefault("stage", stage)
         report.setdefault("attempt", attempt)
         report.setdefault("subagent_id", subagent_id)
