@@ -80,6 +80,8 @@ PATBTAWO_RUN_COMMAND_KEYS = {
     "PATBTAWO_DEPLOY_RUN_COMMAND",
     "PATBTAWO_SMOKE_RUN_COMMAND",
 }
+PROCESS_ENCODING = "utf-8"
+PROCESS_ERRORS = "replace"
 
 
 class ConfigError(RuntimeError):
@@ -175,6 +177,8 @@ def run_local(
         cwd=str(cwd),
         env=dict(env) if env else None,
         text=True,
+        encoding=PROCESS_ENCODING,
+        errors=PROCESS_ERRORS,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -1525,6 +1529,8 @@ class CommandProvider:
             command,
             shell=True,
             text=True,
+            encoding=PROCESS_ENCODING,
+            errors=PROCESS_ERRORS,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1780,6 +1786,8 @@ class StageRunner:
                 env=env,
                 shell=True,
                 text=True,
+                encoding=PROCESS_ENCODING,
+                errors=PROCESS_ERRORS,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=self.config.stage_timeout_seconds,

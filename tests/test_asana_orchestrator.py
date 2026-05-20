@@ -339,6 +339,33 @@ class BuiltinStageAdapterTests(unittest.TestCase):
             self.assertEqual(report["task_id"], "TASK-1")
             self.assertIn("PATBTAWO_BUILDER_RUN_COMMAND", report["next_action"])
 
+    def test_packaged_builder_handles_agent_output_with_undecodable_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            noisy = tmp_path / "noisy.py"
+            noisy.write_text(
+                "import sys\nsys.stdout.buffer.write(b'agent output: \\x9d\\n')\n",
+                encoding="utf-8",
+            )
+            env = self.stage_env(tmp_path, stage="builder")
+            env["PATBTAWO_BUILDER_RUN_COMMAND"] = f'"{sys.executable}" "{noisy}"'
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.builder"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(report["status"], "success")
+            self.assertIn("agent output:", completed.stdout)
+
     def test_packaged_verifier_autodetects_unittest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

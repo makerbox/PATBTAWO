@@ -20,6 +20,8 @@ from urllib import error, request
 
 SUCCESS_STATUSES = {"success", "passed"}
 TRANSIENT_EXIT_CODES = {75}
+PROCESS_ENCODING = "utf-8"
+PROCESS_ERRORS = "replace"
 
 
 def utc_now() -> str:
@@ -61,6 +63,8 @@ def changed_files() -> List[str]:
         completed = subprocess.run(
             ["git", "status", "--porcelain"],
             text=True,
+            encoding=PROCESS_ENCODING,
+            errors=PROCESS_ERRORS,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -136,6 +140,15 @@ def command_from_env(names: Sequence[str]) -> str:
     return ""
 
 
+def write_stdout(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or PROCESS_ENCODING
+        sys.stdout.buffer.write(text.encode(encoding, errors=PROCESS_ERRORS))
+    sys.stdout.flush()
+
+
 def run_shell(command: str, *, log_name: str) -> Dict[str, Any]:
     artifact_dir().mkdir(parents=True, exist_ok=True)
     log_path = artifact_dir() / log_name
@@ -144,12 +157,14 @@ def run_shell(command: str, *, log_name: str) -> Dict[str, Any]:
         command,
         shell=True,
         text=True,
+        encoding=PROCESS_ENCODING,
+        errors=PROCESS_ERRORS,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
     duration = time.monotonic() - started
     output = completed.stdout or ""
-    sys.stdout.write(output)
+    write_stdout(output)
     log_path.write_text(
         "\n".join(
             [
