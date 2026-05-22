@@ -1,0 +1,169 @@
+"""Deploy the current worktree to the production server.
+
+Reads deploy target details from ORCHESTRATOR_DEPLOY_* env vars
+(set by the orchestrator deployer stage adapter). Skips deployment
+if the builder did not change any files.
+
+Requires: ssh.exe (OpenSSH for Windows ships with Windows 10+).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+def fail(message: str) -> int:
+    print(f"deploy-prod: {message}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    host = os.environ.get("ORCHESTRATOR_DEPLOY_HOST", "").strip()
+    user = os.environ.get("ORCHESTRATOR_DEPLOY_USER", "").strip()
+    remote_path = os.environ.get("ORCHESTRATOR_DEPLOY_PATH", "").strip()
+    ssh_key = os.environ.get("ORCHESTRATOR_DEPLOY_SSH_KEY_PATH", "").strip()
+    attempt_artifact_dir = os.environ.get("ORCHESTRATOR_ATTEMPT_ARTIFACT_DIR", "").strip()
+
+    if not host:
+        return fail("ORCHESTRATOR_DEPLOY_HOST is not set")
+    if not user:
+        return fail("ORCHESTRATOR_DEPLOY_USER is not set")
+    if not remote_path:
+        return fail("ORCHESTRATOR_DEPLOY_PATH is not set")
+
+    # --- Guard: only deploy if builder actually changed files ---
+    if attempt_artifact_dir:
+        builder_report = Path(attempt_artifact_dir) / "builder" / "builder_report.json"
+        if builder_report.exists():
+            report = json.loads(builder_report.read_text(encoding="utf-8"))
+            changed_files = report.get("changed_files") or []
+            if not changed_files:
+                print("deploy-prod: no files changed by builder; skipping deployment.")
+                return 0
+
+    remote = f"{user}@{host}"
+    ssh_base = ["ssh"]
+    if ssh_key:
+        ssh_base.extend(["-i", ssh_key])
+    ssh_base.extend(["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"])
+    scp_base = ["scp"]
+    if ssh_key:
+        scp_base.extend(["-i", ssh_key])
+
+    # All SSH/SCP invocations below use these pre-built arg lists so that
+    # *every* connection gets the same non-interactive / timeout settings.
+    ssh_args = [*ssh_base]
+    scp_args = [*scp_base]
+
+    # --- Verify SSH connectivity ---
+    print(f"deploy-prod: checking SSH access to {remote} ...")
+    check = subprocess.run(
+        [*ssh_args, remote, "echo", "ok"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if check.returncode != 0:
+        print(f"deploy-prod: SSH check failed ({check.returncode})", file=sys.stderr)
+        print(f"  stdout: {check.stdout.strip()}", file=sys.stderr)
+        print(f"  stderr: {check.stderr.strip()}", file=sys.stderr)
+        return fail(
+            f"Cannot connect to {remote}. Check:\n"
+            f"  1. SSH key path: {ssh_key or '(using default identity)'}\n"
+            f"  2. Host is reachable: ssh {remote}\n"
+            f"  3. Deploy user exists on target server"
+        )
+
+    # --- Ensure remote directory exists ---
+    print(f"deploy-prod: ensuring remote directory {remote_path} ...")
+    subprocess.run(
+        [*ssh_args, remote, "mkdir", "-p", remote_path],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+
+    # --- Sync files via tar pipe over SSH ---
+    print(f"deploy-prod: syncing files to {remote}:{remote_path} ...")
+
+    exclude_patterns = {
+        ".git", ".orchestrator", "__pycache__", ".env",
+        ".env.example", "node_modules", ".next",
+    }
+    exclude_suffixes = {".pyc"}
+
+    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
+        tar_path = tmp.name
+        with tarfile.open(fileobj=tmp, mode="w|gz") as tar:
+            for entry in Path(".").iterdir():
+                name = entry.name
+                if name in exclude_patterns:
+                    continue
+                if entry.suffix in exclude_suffixes:
+                    continue
+                if entry.is_dir() and name.startswith("."):
+                    continue
+                tar.add(entry, arcname=name, recursive=True)
+
+    ssh = subprocess.Popen(
+        [*ssh_args, remote, "tar", "xzf", "-", "-C", remote_path],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    with open(tar_path, "rb") as f:
+        stdout, stderr = ssh.communicate(f.read())
+
+    os.unlink(tar_path)
+
+    if ssh.returncode != 0:
+        print(f"deploy-prod: sync failed ({ssh.returncode})", file=sys.stderr)
+        if stderr:
+            print(f"  stderr: {stderr.decode().strip()}", file=sys.stderr)
+        return fail("File sync to production server failed")
+
+    # --- Install dependencies and build ---
+    print(f"deploy-prod: installing npm dependencies on {remote} ...")
+    npm_install = subprocess.run(
+        [*ssh_args, remote, "npm", "install", "--omit=dev", "--prefix", remote_path],
+        capture_output=True, text=True, timeout=120,
+    )
+    if npm_install.returncode != 0:
+        print(f"deploy-prod: npm install failed ({npm_install.returncode})", file=sys.stderr)
+        if npm_install.stderr:
+            print(f"  stderr: {npm_install.stderr.strip()}", file=sys.stderr)
+        return fail("npm install failed on production server")
+
+    print(f"deploy-prod: building Next.js app ...")
+    npm_build = subprocess.run(
+        [*ssh_args, remote, "npm", "run", "build", "--prefix", remote_path],
+        capture_output=True, text=True, timeout=300,
+    )
+    if npm_build.returncode != 0:
+        print(f"deploy-prod: npm run build failed ({npm_build.returncode})", file=sys.stderr)
+        if npm_build.stderr:
+            print(f"  stderr: {npm_build.stderr.strip()}", file=sys.stderr)
+        return fail("Next.js build failed on production server")
+
+    # --- Restart PM2 process ---
+    print(f"deploy-prod: restarting PM2 process ...")
+    pm2 = subprocess.run(
+        [*ssh_args, remote, "pm2", "start", f"{remote_path}/ecosystem.config.js", "--update-env"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if "already" in pm2.stdout or "already" in pm2.stderr:
+        pm2 = subprocess.run(
+            [*ssh_args, remote, "pm2", "restart", f"{remote_path}/ecosystem.config.js", "--update-env"],
+            capture_output=True, text=True, timeout=30,
+        )
+    if pm2.returncode != 0:
+        print(f"deploy-prod: PM2 start/restart failed ({pm2.returncode})", file=sys.stderr)
+        if pm2.stderr:
+            print(f"  stderr: {pm2.stderr.strip()}", file=sys.stderr)
+        return fail("PM2 process management failed")
+    print(f"deploy-prod: deploy complete ({pm2.stdout.strip()})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

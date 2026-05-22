@@ -15,15 +15,20 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
-    "asana_orchestrator", ROOT / "scripts" / "asana_orchestrator.py"
+    "task_orchestrator", ROOT / "scripts" / "task_orchestrator.py"
 )
 orchestrator = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
-sys.modules["asana_orchestrator"] = orchestrator
+sys.modules["task_orchestrator"] = orchestrator
 SPEC.loader.exec_module(orchestrator)
 
 
 def make_config(tmp_path: Path, *, timeout: int | None = None) -> orchestrator.OrchestratorConfig:
+    context_path = tmp_path / "context.md"
+    context_path.write_text(
+        "# Project Context\n\n## Manual Notes\n\n## Recent Work\n\n",
+        encoding="utf-8",
+    )
     return orchestrator.OrchestratorConfig(
         provider_name="asana",
         provider_options={"ASANA_ACCESS_TOKEN": "token"},
@@ -41,10 +46,14 @@ def make_config(tmp_path: Path, *, timeout: int | None = None) -> orchestrator.O
         dry_run=True,
         base_branch="main",
         repo_root=tmp_path,
+        context_path=context_path,
         worktree_root=tmp_path / "worktrees",
         artifact_root=tmp_path / "artifacts",
         builder_command="builder",
         verifier_command="verifier",
+        context_update_command=None,
+        planner_command=None,
+        planner_tag="plan",
         deploy_command=None,
         smoke_command=None,
         deploy_enabled=False,
@@ -90,8 +99,86 @@ class StageEnvironmentTests(unittest.TestCase):
 
         self.assertEqual(stage_env["ORCHESTRATOR_MODEL"], "gpt-5.4-mini")
 
+    def test_stage_runner_exposes_shared_context_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            writer = tmp_path / "writer.py"
+            writer.write_text(
+                """
+import json
+import os
+
+report = {
+    "task_id": os.environ["ORCHESTRATOR_TASK_ID"],
+    "status": "success",
+    "summary": os.environ["ORCHESTRATOR_CONTEXT_PATH"],
+    "changed_files": [],
+    "checks": [{"name": "context path", "status": "passed"}],
+    "failures": [],
+    "next_action": "continue",
+    "artifact_paths": [],
+}
+with open(os.environ["ORCHESTRATOR_REPORT_PATH"], "w", encoding="utf-8") as fh:
+    json.dump(report, fh)
+""".lstrip(),
+                encoding="utf-8",
+            )
+
+            runner = orchestrator.StageRunner(
+                dataclasses.replace(make_config(tmp_path), deploy_policy="tagged", deploy_tag="production")
+            )
+            outcome = runner.run(
+                stage="builder",
+                command=f'"{sys.executable}" "{writer}"',
+                task_contract={"gid": "123", "name": "Task"},
+                attempt=1,
+                worktree_path=worktree,
+                attempt_artifact_dir=tmp_path / "artifacts" / "attempt-1",
+            )
+
+            self.assertTrue(outcome.succeeded)
+            self.assertEqual(outcome.summary, str(tmp_path / "context.md"))
+
 
 class StageRunnerTests(unittest.TestCase):
+    def test_deployer_skips_report_only_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            attempt_dir = tmp_path / "artifacts" / "attempt-1"
+            builder_report_dir = attempt_dir / "builder"
+            builder_report_dir.mkdir(parents=True)
+            orchestrator.atomic_write_json(
+                builder_report_dir / "builder_report.json",
+                {
+                    "task_id": "123",
+                    "status": "success",
+                    "summary": "Checked server access and reported findings.",
+                    "changed_files": [],
+                    "checks": [{"name": "ssh", "status": "passed"}],
+                    "failures": [],
+                    "next_action": "No deploy required.",
+                    "artifact_paths": [],
+                },
+            )
+
+            runner = orchestrator.StageRunner(
+                dataclasses.replace(make_config(tmp_path), deploy_policy="tagged", deploy_tag="production")
+            )
+            outcome = runner.run(
+                stage="deployer",
+                command=f'"{sys.executable}" -c "raise SystemExit(99)"',
+                task_contract={"gid": "123", "name": "Check production server connection"},
+                attempt=1,
+                worktree_path=tmp_path,
+                attempt_artifact_dir=attempt_dir,
+            )
+
+            self.assertTrue(outcome.succeeded)
+            self.assertIn("Skipped deploy/smoke", outcome.summary)
+            self.assertTrue(outcome.report["deploy_skipped"])
+
     def test_stage_runner_accepts_valid_command_report(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -453,6 +540,64 @@ sys.exit(0 if sys.argv[1:] == [expected, expected] else 1)
             report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
             self.assertEqual(completed.returncode, 0, completed.stdout)
             self.assertEqual(report["status"], "success")
+
+    def test_packaged_context_updater_rewrites_shared_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            context_path = tmp_path / "context.md"
+            context_path.write_text(
+                "# Project Context\n\n## Manual Notes\n\n## Recent Work\n\n",
+                encoding="utf-8",
+            )
+            summary_path = tmp_path / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "task_id": "TASK-1",
+                        "task_name": "Ship the thing",
+                        "stages": {
+                            "builder": {"summary": "Built the thing"},
+                            "verifier": {"summary": "Verified the thing"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            updater = tmp_path / "updater.py"
+            updater.write_text(
+                """
+import json
+import os
+from pathlib import Path
+
+summary = json.loads(Path(os.environ["ORCHESTRATOR_TASK_SUMMARY_PATH"]).read_text(encoding="utf-8"))
+context_path = Path(os.environ["ORCHESTRATOR_CONTEXT_PATH"])
+context = context_path.read_text(encoding="utf-8")
+context += f"- {summary['task_id']}: {summary['task_name']}\\n"
+context_path.write_text(context, encoding="utf-8")
+""".lstrip(),
+                encoding="utf-8",
+            )
+            env = self.stage_env(tmp_path, stage="context")
+            env["ORCHESTRATOR_TASK_SUMMARY_PATH"] = str(summary_path)
+            env["ORCHESTRATOR_CONTEXT_PATH"] = str(context_path)
+            env["PATBTAWO_CONTEXT_UPDATE_COMMAND"] = f'"{sys.executable}" "{updater}"'
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "patbtawo.context_updater"],
+                cwd=tmp_path,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            report = json.loads(Path(env["ORCHESTRATOR_REPORT_PATH"]).read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 0, completed.stdout)
+            self.assertEqual(report["status"], "success")
+            self.assertIn("TASK-1: Ship the thing", context_path.read_text(encoding="utf-8"))
 
     def test_packaged_verifier_autodetects_unittest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -867,6 +1012,233 @@ class OrchestratorQueueTests(unittest.TestCase):
             self.assertEqual(failed_moves, [("task-1", "failed"), ("task-2", "failed")])
             self.assertEqual(outcomes, [])
 
+    def test_run_attempt_refreshes_shared_context_before_merge(self) -> None:
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.moves = []
+                self.comments = []
+
+            def move_task(self, task_gid, section_gid):
+                self.moves.append((task_gid, section_gid))
+
+            def comment(self, task_gid, text):
+                self.comments.append((task_gid, text))
+
+        class FakeRunner:
+            def run(
+                self,
+                *,
+                stage,
+                command,
+                task_contract,
+                attempt,
+                worktree_path,
+                attempt_artifact_dir,
+                extra_env=None,
+            ):
+                report_path = attempt_artifact_dir / stage / f"{stage}_report.json"
+                log_path = attempt_artifact_dir / stage / f"{stage}.log"
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                if stage == "context":
+                    context_path = worktree_path / "context.md"
+                    context_path.write_text(
+                        "# Project Context\n\n## Manual Notes\n\n## Recent Work\n\n- task-1 completed\n",
+                        encoding="utf-8",
+                    )
+                report = {
+                    "task_id": task_contract["gid"],
+                    "status": "success",
+                    "summary": f"{stage} completed",
+                    "changed_files": ["context.md"] if stage == "context" else [],
+                    "checks": [{"name": stage, "status": "passed"}],
+                    "failures": [],
+                    "next_action": "continue",
+                    "artifact_paths": [str(log_path)],
+                }
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                log_path.write_text(f"{stage} log\n", encoding="utf-8")
+                return orchestrator.StageOutcome(
+                    stage=stage,
+                    status="success",
+                    summary=f"{stage} completed",
+                    report=report,
+                    report_path=report_path,
+                    log_path=log_path,
+                    retryable=False,
+                    exit_code=0,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            (repo / "context.md").write_text("# Project Context\n\n## Manual Notes\n\n## Recent Work\n\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md", "context.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                repo_root=repo,
+                context_path=repo / "context.md",
+                worktree_root=tmp_path / "worktrees",
+                artifact_root=tmp_path / "artifacts",
+                base_branch="main",
+                objective_verifier=False,
+                deploy_enabled=False,
+                context_update_command="python -m patbtawo.context_updater",
+            )
+            provider = FakeProvider()
+            task_orchestrator = orchestrator.TaskOrchestrator(config, provider)
+            task_orchestrator.runner = FakeRunner()
+
+            worktree_path, _ = task_orchestrator.worktrees.create("task-1", 1, stage="builder")
+            try:
+                outcome = task_orchestrator._run_attempt(
+                    {"gid": "task-1", "name": "Task 1"},
+                    1,
+                    tmp_path / "artifacts" / "attempt-1",
+                    worktree_path,
+                )
+            finally:
+                task_orchestrator.worktrees.remove(worktree_path)
+
+            self.assertTrue(outcome.succeeded)
+            self.assertEqual(outcome.stage, "context")
+            self.assertIn(("task-1", config.sections["done"]), provider.moves)
+            self.assertIn("- task-1 completed", (repo / "context.md").read_text(encoding="utf-8"))
+
+    def test_planning_task_creates_ready_tasks_and_marks_source_done(self) -> None:
+        class FakeProvider:
+            def __init__(self) -> None:
+                self.created = []
+                self.moves = []
+                self.comments = []
+
+            def create_task(self, *, title, description, ready_state, tags=(), parent_task_id=""):
+                self.created.append(
+                    {
+                        "title": title,
+                        "description": description,
+                        "ready_state": ready_state,
+                        "tags": list(tags),
+                        "parent_task_id": parent_task_id,
+                    }
+                )
+                return {
+                    "gid": f"created-{len(self.created)}",
+                    "name": title,
+                    "permalink_url": f"https://example.invalid/{len(self.created)}",
+                }
+
+            def move_task(self, task_gid, section_gid):
+                self.moves.append((task_gid, section_gid))
+
+            def comment(self, task_gid, text):
+                self.comments.append((task_gid, text))
+
+        class FakeRunner:
+            def run(
+                self,
+                *,
+                stage,
+                command,
+                task_contract,
+                attempt,
+                worktree_path,
+                attempt_artifact_dir,
+                extra_env=None,
+            ):
+                report_path = attempt_artifact_dir / stage / f"{stage}_report.json"
+                log_path = attempt_artifact_dir / stage / f"{stage}.log"
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                plan_path = Path((extra_env or {})["ORCHESTRATOR_TASK_PLAN_PATH"])
+                orchestrator.atomic_write_json(
+                    plan_path,
+                    {
+                        "tasks": [
+                            {
+                                "title": "Build route",
+                                "description": "Add the public route.",
+                                "acceptance_criteria": ["Route returns 200"],
+                                "tags": ["deploy"],
+                            }
+                        ]
+                    },
+                )
+                report = {
+                    "task_id": task_contract["gid"],
+                    "status": "success",
+                    "summary": "planned",
+                    "changed_files": [],
+                    "checks": [{"name": "plan", "status": "passed"}],
+                    "failures": [],
+                    "next_action": "create tasks",
+                    "artifact_paths": [str(log_path), str(plan_path)],
+                }
+                orchestrator.atomic_write_json(report_path, report)
+                log_path.write_text("planner log\n", encoding="utf-8")
+                return orchestrator.StageOutcome(
+                    stage=stage,
+                    status="success",
+                    summary="planned",
+                    report=report,
+                    report_path=report_path,
+                    log_path=log_path,
+                    retryable=False,
+                    exit_code=0,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            config = dataclasses.replace(
+                make_config(tmp_path),
+                planner_command="python -m patbtawo.planner",
+                planner_tag="plan",
+            )
+            provider = FakeProvider()
+            task_orchestrator = orchestrator.TaskOrchestrator(config, provider)
+            task_orchestrator.runner = FakeRunner()
+
+            outcome = task_orchestrator._run_attempt(
+                {
+                    "gid": "plan-1",
+                    "name": "Break this goal into deployable chunks",
+                    "notes": "Create a task for each chunk and tag them deploy.",
+                    "tags": [{"name": "plan"}],
+                    "permalink_url": "https://example.invalid/plan-1",
+                },
+                1,
+                tmp_path / "artifacts" / "attempt-1",
+                worktree,
+            )
+
+            self.assertTrue(outcome.succeeded)
+            self.assertEqual(outcome.stage, "planner")
+            self.assertEqual(provider.created[0]["ready_state"], config.sections["ready"])
+            self.assertEqual(provider.created[0]["tags"], ["deploy"])
+            self.assertIn("Acceptance criteria", provider.created[0]["description"])
+            self.assertIn(("plan-1", config.sections["done"]), provider.moves)
+            self.assertIn("created_tasks", outcome.report)
+
 
 class WorktreeIsolationTests(unittest.TestCase):
     def test_remove_handles_read_only_worktree_files(self) -> None:
@@ -985,8 +1357,112 @@ class WorktreeIsolationTests(unittest.TestCase):
             )
             self.assertNotEqual(branch_check.returncode, 0)
 
+    def test_reset_attempts_removes_state_artifacts_worktrees_and_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            repo = tmp_path / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+
+            worktree_root = tmp_path / "worktrees"
+            artifact_root = tmp_path / "artifacts"
+            worktree_root.mkdir()
+            artifact_root.mkdir()
+            config = orchestrator.AttemptResetConfig(
+                repo_root=repo.resolve(),
+                worktree_root=worktree_root.resolve(),
+                artifact_root=artifact_root.resolve(),
+            )
+
+            branch = "orchestrator/TASK-1-attempt-1-builder-20260521T000000000000Z"
+            git_worktree = worktree_root / "TASK-1-attempt-1-builder-20260521T000000000000Z"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", branch, str(git_worktree), "HEAD"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            stale_worktree = worktree_root / "TASK-2-attempt-1-builder-20260521T000000000000Z"
+            stale_worktree.mkdir()
+            kept_worktree_dir = worktree_root / "manual-checkout"
+            kept_worktree_dir.mkdir()
+
+            attempt_dir = artifact_root / "TASK-1" / "attempt-001-20260521T000000000000Z"
+            attempt_dir.mkdir(parents=True)
+            (attempt_dir / "builder.log").write_text("log\n", encoding="utf-8")
+            kept_artifact = artifact_root / "notes.txt"
+            kept_artifact.write_text("keep\n", encoding="utf-8")
+            orchestrator.atomic_write_json(
+                artifact_root / "orchestrator_state.json",
+                {"active_attempt": {"task_id": "TASK-1", "worktree_path": str(git_worktree)}},
+            )
+
+            counts = orchestrator.reset_attempts(config)
+
+            self.assertEqual(counts["state_files"], 1)
+            self.assertEqual(counts["worktrees"], 1)
+            self.assertEqual(counts["stale_worktree_dirs"], 1)
+            self.assertEqual(counts["branches"], 1)
+            self.assertEqual(counts["artifact_dirs"], 1)
+            self.assertFalse(git_worktree.exists())
+            self.assertFalse(stale_worktree.exists())
+            self.assertTrue(kept_worktree_dir.exists())
+            self.assertFalse(attempt_dir.exists())
+            self.assertTrue(kept_artifact.exists())
+            self.assertNotIn("active_attempt", orchestrator.read_json(artifact_root / "orchestrator_state.json"))
+
+            branch_check = subprocess.run(
+                ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                cwd=repo,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            self.assertNotEqual(branch_check.returncode, 0)
+
 
 class ConfigTests(unittest.TestCase):
+    def test_task_has_deploy_tag_reads_clickup_tags(self) -> None:
+        task_contract = {
+            "gid": "task-1",
+            "raw": {"tags": [{"name": "Production"}, {"name": "other"}]},
+        }
+
+        self.assertTrue(orchestrator.task_has_deploy_tag(task_contract, "production"))
+        self.assertFalse(orchestrator.task_has_deploy_tag(task_contract, "staging"))
+
+    def test_normalize_deploy_policy_keeps_backward_enabled_flag(self) -> None:
+        self.assertEqual(
+            orchestrator.normalize_deploy_policy(None, deploy_enabled_value="true", has_deploy_command=False),
+            "all",
+        )
+        self.assertEqual(
+            orchestrator.normalize_deploy_policy(None, deploy_enabled_value="false", has_deploy_command=True),
+            "none",
+        )
+        self.assertEqual(
+            orchestrator.normalize_deploy_policy("tagged-only", deploy_enabled_value=None, has_deploy_command=True),
+            "tagged",
+        )
+
     def test_env_file_does_not_override_existing_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".env"
@@ -1048,6 +1524,19 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.retry_limit, 2)
             self.assertFalse(config.deploy_enabled)
 
+    def test_reset_attempts_cli_does_not_require_provider_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(repo)
+                self.assertEqual(orchestrator.main(["--reset-attempts", "--dry-run"]), 0)
+            finally:
+                os.chdir(old_cwd)
+
     def test_config_from_env_collects_stage_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
@@ -1098,6 +1587,23 @@ class ConfigTests(unittest.TestCase):
             message = str(context.exception)
             self.assertIn("builder command references missing local path", message)
             self.assertIn("scripts/builder.py", message)
+
+    def test_validate_runtime_config_rejects_missing_context_file_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            config = make_config(tmp_path)
+            context_path = tmp_path / "context.md"
+            context_path.unlink()
+            config = dataclasses.replace(
+                config,
+                context_path=context_path,
+                context_update_command="python -m patbtawo.context_updater",
+            )
+
+            with self.assertRaises(orchestrator.ConfigError) as context:
+                orchestrator.validate_runtime_config(config)
+
+            self.assertIn("Missing shared context file", str(context.exception))
 
     def test_validate_runtime_config_rejects_misordered_codex_approval_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

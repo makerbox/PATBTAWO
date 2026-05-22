@@ -14,11 +14,13 @@ real git repository that should receive per-task worktrees.
 Provider adapters were aligned to these official API surfaces:
 
 - [Asana tasks from a section](https://developers.asana.com/reference/gettasksforsection),
+  [create task](https://developers.asana.com/reference/createtask),
   [add task to section](https://developers.asana.com/reference/addtaskforsection),
   and [create story/comment](https://developers.asana.com/reference/createstoryfortask)
 - [Trello cards API](https://developer.atlassian.com/cloud/trello/rest/api-group-cards/)
   and [lists API](https://developer.atlassian.com/cloud/trello/rest/api-group-lists/)
 - [ClickUp get tasks](https://developer.clickup.com/reference/gettasks),
+  [create task](https://developer.clickup.com/reference/createtask),
   [update task](https://developer.clickup.com/reference/updatetask), and
   [create task comment](https://developer.clickup.com/reference/createtaskcomment)
 - [Jira issue search](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-search/),
@@ -67,27 +69,34 @@ The orchestrator processes exactly one Ready task at a time:
 
 1. Fetch the first task from the configured Ready state.
 2. Read the full task contract from the provider.
-3. Create a fresh builder worktree from `ORCHESTRATOR_BASE_BRANCH`.
-4. Move the task to Building.
-5. Run the builder agent command in the builder worktree.
-6. Require the builder JSON report.
-7. Checkpoint the builder's file changes.
-8. Move passing builds to Verifying.
-9. Create a fresh verifier worktree from the checkpoint.
-10. Run the verifier agent command in that isolated verifier worktree.
-11. Require the verifier JSON report and capture a verifier log.
-12. Fail verification if the verifier modifies tracked files.
-13. If deploy is enabled, create a fresh deployer worktree from the verified
+3. If the task is a planning task and a planner is configured, run the planner
+   stage, validate its task plan, create each planned item in Ready, then move
+   the original planning task to Done.
+4. Create a fresh builder worktree from `ORCHESTRATOR_BASE_BRANCH`.
+5. Move the task to Building.
+6. Run the builder agent command in the builder worktree.
+7. Require the builder JSON report.
+8. Checkpoint the builder's file changes.
+9. Move passing builds to Verifying.
+10. Create a fresh verifier worktree from the checkpoint.
+11. Run the verifier agent command in that isolated verifier worktree.
+12. Require the verifier JSON report and capture a verifier log.
+13. Fail verification if the verifier modifies tracked files.
+14. If deploy is enabled, create a fresh deployer worktree from the verified
     checkpoint, move the task to Deploying, and run deploy/smoke.
-14. Fast-forward merge successful task changes back into `ORCHESTRATOR_BASE_BRANCH`.
-15. Delete the temporary attempt branches after their worktrees are removed.
-16. Move successful tasks to Done.
-17. Move failed tasks to Failed.
-18. Move externally blocked tasks to Blocked.
-19. Comment concise status back to the provider.
-20. Retry retryable/transient stage failures with a fresh worktree until the
+15. If a context updater is configured, create a fresh context worktree from
+    the verified checkpoint, refresh `context.md`, and keep the update in the
+    same merge-back path as the task changes.
+16. Fast-forward merge successful task changes back into
+    `ORCHESTRATOR_BASE_BRANCH`.
+17. Delete the temporary attempt branches after their worktrees are removed.
+18. Move successful tasks to Done.
+19. Move failed tasks to Failed.
+20. Move externally blocked tasks to Blocked.
+21. Comment concise status back to the provider.
+22. Retry retryable/transient stage failures with a fresh worktree until the
     retry limit is exhausted.
-21. Continue until the Ready queue is empty.
+23. Continue until the Ready queue is empty.
 
 The Ready queue is consumed top-down. PATBTAWO uses each provider's native
 list, view, position, or rank order where it is available, such as Trello `pos`,
@@ -112,13 +121,19 @@ ORCHESTRATOR_STATE_FAILED_ID=
 ORCHESTRATOR_STATE_DEPLOYING_ID=
 ORCHESTRATOR_STATE_DONE_ID=
 ORCHESTRATOR_STATE_BLOCKED_ID=
+ORCHESTRATOR_CONTEXT_PATH=context.md
 ORCHESTRATOR_BUILDER_AGENT_COMMAND=python -m patbtawo.builder
 ORCHESTRATOR_VERIFIER_AGENT_COMMAND=python -m patbtawo.verifier
+ORCHESTRATOR_PLANNER_AGENT_COMMAND=python -m patbtawo.planner
+ORCHESTRATOR_PLANNER_TAG=plan
+ORCHESTRATOR_CONTEXT_UPDATER_AGENT_COMMAND=python -m patbtawo.context_updater
 ORCHESTRATOR_DEPLOYER_AGENT_COMMAND=python -m patbtawo.deployer
 ORCHESTRATOR_SMOKE_COMMAND=python -m patbtawo.smoke
 ORCHESTRATOR_MODEL=gpt-5.4-mini
 PATBTAWO_BUILDER_RUN_COMMAND=
 PATBTAWO_VERIFIER_RUN_COMMAND=
+PATBTAWO_PLANNER_RUN_COMMAND=
+PATBTAWO_CONTEXT_UPDATE_COMMAND=
 PATBTAWO_DEPLOY_RUN_COMMAND=
 PATBTAWO_SMOKE_RUN_COMMAND=
 ```
@@ -126,11 +141,48 @@ PATBTAWO_SMOKE_RUN_COMMAND=
 Example builder run command:
 
 ```sh
-PATBTAWO_BUILDER_RUN_COMMAND=codex -m "${ORCHESTRATOR_MODEL}" --ask-for-approval never exec --sandbox workspace-write "Read the task contract at ${ORCHESTRATOR_TASK_CONTRACT_PATH}. Implement the requested change in this worktree. Keep edits scoped, run relevant checks, and do not commit."
+PATBTAWO_BUILDER_RUN_COMMAND=opencode run -m "${ORCHESTRATOR_MODEL}" --dangerously-skip-permissions "Read the task contract at ${ORCHESTRATOR_TASK_CONTRACT_PATH} and the shared context at ${ORCHESTRATOR_CONTEXT_PATH}. Implement the requested change in this worktree. Keep edits scoped, run relevant checks, and do not commit."
 ```
 
-For Codex CLI, keep global CLI flags such as `--ask-for-approval` before the
-`exec` subcommand.
+Example context update command:
+
+```sh
+PATBTAWO_CONTEXT_UPDATE_COMMAND=opencode run -m "${ORCHESTRATOR_MODEL}" --dangerously-skip-permissions "Read ${ORCHESTRATOR_TASK_SUMMARY_PATH} and refresh ${ORCHESTRATOR_CONTEXT_PATH} with a concise durable summary of the task that just completed."
+```
+
+Example planner command:
+
+```sh
+PATBTAWO_PLANNER_RUN_COMMAND=opencode run -m "${ORCHESTRATOR_MODEL}" --dangerously-skip-permissions "Read ${ORCHESTRATOR_TASK_CONTRACT_PATH} and ${ORCHESTRATOR_CONTEXT_PATH}. Break the goal into actionable, independently deployable tasks. Write JSON to ${ORCHESTRATOR_TASK_PLAN_PATH} with a tasks array. Include tags such as deploy when requested."
+```
+
+The planner output can be either the JSON plan file at
+`ORCHESTRATOR_TASK_PLAN_PATH` or a `tasks`/`task_plan` field in the planner
+report. The preferred file format is:
+
+```json
+{
+  "tasks": [
+    {
+      "title": "Add production health route",
+      "description": "Implement GET /health and cover it with tests.",
+      "acceptance_criteria": ["GET /health returns 200 JSON"],
+      "tags": ["deploy"]
+    }
+  ]
+}
+```
+
+Planning tasks are detected when `ORCHESTRATOR_PLANNER_AGENT_COMMAND` is set and
+the task has the tag named by `ORCHESTRATOR_PLANNER_TAG` or its text clearly
+asks to break/create/turn work into tasks, tickets, chunks, or work items.
+PATBTAWO validates the plan, creates every item in the provider's Ready state,
+then marks the original planning task Done with created task IDs/links in the
+handoff comment. Providers with native tag support receive the planned tags;
+other providers preserve planned tags in the task description or comments.
+
+For opencode, `--dangerously-skip-permissions` auto-approves prompts (yolo
+mode). Place it before the prompt string.
 
 PATBTAWO expands `${VAR}`, `$VAR`, and `%VAR%` in stage command strings before
 launching the platform shell. Prefer `${VAR}` in shared examples because the
@@ -146,18 +198,28 @@ Optional local behavior:
 
 - `ORCHESTRATOR_RETRY_LIMIT`, default `0`
 - `ORCHESTRATOR_DRY_RUN`, default `false`
-- `ORCHESTRATOR_BASE_BRANCH`, default current git branch or `HEAD`
+- `ORCHESTRATOR_BASE_BRANCH`, default current git branch or `HEAD`; set this to
+  a named branch such as `main` if you want successful attempts fast-forward
+  merged back before the next task starts
 - `ORCHESTRATOR_WORKTREE_ROOT`, default `../.<repo>-orchestrator-worktrees`
 - `ORCHESTRATOR_ARTIFACT_ROOT`, default `.orchestrator/artifacts`
 - `ORCHESTRATOR_STAGE_TIMEOUT_SECONDS`
 - `ORCHESTRATOR_KEEP_WORKTREES`, default `false`
 - `ORCHESTRATOR_OBJECTIVE_VERIFIER`, default `true`
+- `ORCHESTRATOR_CONTEXT_PATH`
+- `ORCHESTRATOR_CONTEXT_UPDATER_AGENT_COMMAND`
+- `ORCHESTRATOR_PLANNER_AGENT_COMMAND`
+- `ORCHESTRATOR_PLANNER_TAG`, default `plan`
 - `ORCHESTRATOR_DEPLOY_ENABLED`
+- `ORCHESTRATOR_DEPLOY_POLICY`, one of `all`, `tagged`, or `none`
+- `ORCHESTRATOR_DEPLOY_TAG`, required when `ORCHESTRATOR_DEPLOY_POLICY=tagged`
 - `ORCHESTRATOR_BUILDER_AGENT_COMMAND`
 - `ORCHESTRATOR_VERIFIER_AGENT_COMMAND`
 - `ORCHESTRATOR_DEPLOYER_AGENT_COMMAND`
 - `ORCHESTRATOR_BUILDER_COMMAND`, backward-compatible alias
 - `ORCHESTRATOR_VERIFIER_COMMAND`, backward-compatible alias
+- `PATBTAWO_CONTEXT_UPDATE_COMMAND`
+- `PATBTAWO_PLANNER_RUN_COMMAND`
 - `ORCHESTRATOR_DEPLOY_COMMAND`
 - `ORCHESTRATOR_SMOKE_COMMAND`
 - `ORCHESTRATOR_MODEL`
@@ -168,9 +230,11 @@ Optional local behavior:
 
 The `ORCHESTRATOR_*_AGENT_COMMAND` values are outer stage adapters. The packaged
 `python -m patbtawo.builder`, `python -m patbtawo.verifier`,
+`python -m patbtawo.planner`, `python -m patbtawo.context_updater`,
 `python -m patbtawo.deployer`, and `python -m patbtawo.smoke` adapters always
-write the required JSON reports. Configure the underlying repo-specific work
-with the `PATBTAWO_*_RUN_COMMAND` variables.
+write the required JSON reports.
+Configure the underlying repo-specific work with the `PATBTAWO_*_RUN_COMMAND`
+variables.
 
 Deploy runs only when enabled or when a deploy/smoke command is set. If both
 deploy and smoke commands are set, they run as one deployer stage joined with
@@ -212,7 +276,7 @@ ORCHESTRATOR_STAGE_ENV_PRODUCTION_HOST=prod.example.com
 which passes `PRODUCTION_HOST=prod.example.com` to stage commands.
 
 The `PATBTAWO_*_RUN_COMMAND` variables are plain shell commands. They may launch
-Codex, Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other
+opencode, Claude Code, BMAD, LangGraph, local scripts, CI wrappers, or any other
 executable workflow. The orchestrator starts a fresh subprocess for each stage
 and passes a fresh `ORCHESTRATOR_SUBAGENT_ID` plus the stage role through the
 environment.
@@ -340,6 +404,7 @@ ORCHESTRATOR_COMMAND_NEXT_TASK=./provider-next
 ORCHESTRATOR_COMMAND_GET_TASK=./provider-get
 ORCHESTRATOR_COMMAND_MOVE_TASK=./provider-move
 ORCHESTRATOR_COMMAND_COMMENT_TASK=./provider-comment
+ORCHESTRATOR_COMMAND_CREATE_TASK=./provider-create
 ```
 
 `NEXT_TASK` and `GET_TASK` commands must print a JSON object with at least an
@@ -349,6 +414,9 @@ ORCHESTRATOR_COMMAND_COMMENT_TASK=./provider-comment
 `ORCHESTRATOR_TASK_ID` and `ORCHESTRATOR_COMMENT_TEXT`. The command provider's
 `NEXT_TASK` hook is responsible for returning the top Ready item from its
 underlying system.
+`CREATE_TASK` is optional unless you enable planner tasks. It receives the task
+payload in `ORCHESTRATOR_TASK_CREATE_JSON` and should print the created task as
+JSON with at least an `id`, `gid`, or `key`.
 
 ## Run
 
@@ -395,6 +463,7 @@ variables:
 - `ASANA_TASK_CONTRACT_PATH`
 - `ORCHESTRATOR_REPORT_PATH`
 - `ORCHESTRATOR_LOG_PATH`
+- `ORCHESTRATOR_TASK_PLAN_PATH`
 - `ORCHESTRATOR_ARTIFACT_DIR`
 - `ORCHESTRATOR_ATTEMPT`
 - `ORCHESTRATOR_STAGE_WORKTREE_PATH`
@@ -454,6 +523,24 @@ Worktrees are removed after terminal success, failure, or blocker unless
 `ORCHESTRATOR_KEEP_WORKTREES=true`. Successful attempts are fast-forward merged
 back into `ORCHESTRATOR_BASE_BRANCH` before the task is marked Done, and
 temporary attempt branches are deleted during cleanup.
+
+If local attempt state gets interrupted or stale, reset it from inside the repo:
+
+```sh
+python -m patbtawo --reset-attempts
+```
+
+This clears `active_attempt`, removes `attempt-*` artifact directories, removes
+attempt worktrees under `ORCHESTRATOR_WORKTREE_ROOT`, prunes git worktree
+metadata, and deletes temporary `orchestrator/*-attempt-*` branches. Add
+`--dry-run` to print the cleanup actions without deleting anything.
+
+Deployment scope is controlled by `ORCHESTRATOR_DEPLOY_POLICY`:
+`all` deploys every successful task, `tagged` deploys only tasks carrying the
+tag named by `ORCHESTRATOR_DEPLOY_TAG`, and `none` disables deploy/smoke
+globally. Task or stage text can still opt out with phrases or fields such as
+`skip deploy`, `no deploy`, `deploy: false`, `smoke: false`,
+`skip_deploy: true`, or `deploy_required: false`.
 
 With objective verification enabled, each attempt can create up to three
 worktrees: builder, verifier, and deployer. The verifier and deployer worktrees

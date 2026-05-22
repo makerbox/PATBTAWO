@@ -3,14 +3,16 @@
 
 The orchestrator intentionally keeps its dependencies to Python's standard
 library so it can be dropped into small repositories without adding package
-management first. Builder/verifier/deployer commands are supplied by config and
-must write JSON reports to the path provided in ORCHESTRATOR_REPORT_PATH.
+management first. Builder/verifier/context/deployer commands are supplied by
+config and must write JSON reports to the path provided in
+ORCHESTRATOR_REPORT_PATH.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+from collections.abc import Iterable as IterableABC
 import dataclasses
 import datetime as dt
 from decimal import Decimal, InvalidOperation
@@ -43,6 +45,7 @@ REQUIRED_REPORT_KEYS = (
     "next_action",
     "artifact_paths",
 )
+PLAN_TASK_REQUIRED_KEYS = ("title", "description")
 SUCCESS_STATUSES = {"success", "succeeded", "pass", "passed", "ok", "done"}
 FAILED_STATUSES = {"failed", "failure", "error", "errored"}
 BLOCKED_STATUSES = {"blocked", "blocker", "external_blocker"}
@@ -72,14 +75,36 @@ RESERVED_DEPLOY_ENV_KEYS = {
     "ORCHESTRATOR_DEPLOYER_AGENT_COMMAND",
     "ORCHESTRATOR_SMOKE_COMMAND",
 }
+DEPLOY_SKIP_PATTERN = re.compile(
+    r"\[(?:skip|no)\s+(?:deploy|deployment|smoke)\]"
+    r"|(?:^|\b)(?:skip|no)\s+(?:deploy|deployment|smoke)\b"
+    r"|(?:^|\b)do\s+not\s+(?:deploy|smoke)\b"
+    r"|(?:^|\b)(?:deploy|deployment|smoke)\s*:\s*(?:false|no|skip|none)\b",
+    re.IGNORECASE,
+)
+DEPLOY_FORCE_PATTERN = re.compile(
+    r"\[(?:deploy|deployment|smoke)\]"
+    r"|(?:^|\b)(?:deploy|deployment|smoke)\s*:\s*(?:true|yes|required)\b",
+    re.IGNORECASE,
+)
 PATBTAWO_RUN_COMMAND_KEYS = {
+    "PATBTAWO_PLANNER_RUN_COMMAND",
+    "PATBTAWO_PLAN_RUN_COMMAND",
     "PATBTAWO_BUILDER_RUN_COMMAND",
     "PATBTAWO_BUILD_RUN_COMMAND",
+    "PATBTAWO_CONTEXT_UPDATE_COMMAND",
+    "PATBTAWO_CONTEXT_RUN_COMMAND",
     "PATBTAWO_VERIFIER_RUN_COMMAND",
     "PATBTAWO_VERIFY_RUN_COMMAND",
     "PATBTAWO_DEPLOY_RUN_COMMAND",
     "PATBTAWO_SMOKE_RUN_COMMAND",
 }
+PLANNING_TASK_PATTERN = re.compile(
+    r"\bbreak\b[\s\S]{0,160}\b(?:tasks?|tickets?|chunks?|work items?)\b"
+    r"|\bcreate\s+(?:a\s+)?tasks?\s+for\s+each\s+chunk\b"
+    r"|\bturn\b[\s\S]{0,160}\b(?:tasks?|tickets?|chunks?|work items?)\b",
+    re.IGNORECASE,
+)
 PROCESS_ENCODING = "utf-8"
 PROCESS_ERRORS = "replace"
 ENV_REFERENCE_PATTERN = re.compile(
@@ -233,11 +258,68 @@ def make_writable(path: str) -> None:
         pass
 
 
+def _windows_acl_reset(path: Path, *, recursive: bool = False) -> None:
+    if os.name != "nt":
+        return
+    attrib_args = ["attrib", "-R", "-H", "-S", str(path)]
+    if recursive:
+        attrib_args.extend(["/S", "/D"])
+    try:
+        subprocess.run(
+            attrib_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    username = os.environ.get("USERNAME")
+    if not username:
+        return
+    domain = os.environ.get("USERDOMAIN")
+    principal = f"{domain}\\{username}" if domain else username
+    icacls_args = ["icacls", str(path), "/grant", f"{principal}:(OI)(CI)F", "/C"]
+    if recursive:
+        icacls_args.extend(["/T"])
+    try:
+        subprocess.run(
+            icacls_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def make_tree_removable(path: Path, *, reset_windows_acl: bool = False) -> None:
+    if not path.exists():
+        return
+    if reset_windows_acl:
+        _windows_acl_reset(path)
+    make_writable(str(path))
+
+    def onerror(exc: OSError) -> None:
+        if exc.filename:
+            make_writable(exc.filename)
+            _windows_acl_reset(Path(exc.filename))
+
+    for root, dirs, files in os.walk(path, topdown=False, onerror=onerror):
+        for name in files:
+            make_writable(str(Path(root) / name))
+        for name in dirs:
+            make_writable(str(Path(root) / name))
+
+
 def rmtree_with_retries(path: Path, *, attempts: int = 5, delay_seconds: float = 0.25) -> Optional[Exception]:
     last_error: Optional[Exception] = None
 
     def onerror(func: Any, failed_path: str, _exc_info: Any) -> None:
         make_writable(failed_path)
+        _windows_acl_reset(Path(failed_path))
         try:
             func(failed_path)
         except Exception as exc:  # pragma: no cover - exercised through shutil internals
@@ -245,6 +327,7 @@ def rmtree_with_retries(path: Path, *, attempts: int = 5, delay_seconds: float =
 
     for attempt in range(1, attempts + 1):
         try:
+            make_tree_removable(path, reset_windows_acl=attempt > 1)
             shutil.rmtree(path, onerror=onerror)
             return None
         except FileNotFoundError:
@@ -267,10 +350,14 @@ class OrchestratorConfig:
     dry_run: bool
     base_branch: str
     repo_root: Path
+    context_path: Path
     worktree_root: Path
     artifact_root: Path
     builder_command: str
     verifier_command: str
+    context_update_command: Optional[str]
+    planner_command: Optional[str]
+    planner_tag: Optional[str]
     deploy_command: Optional[str]
     smoke_command: Optional[str]
     deploy_enabled: bool
@@ -278,6 +365,8 @@ class OrchestratorConfig:
     keep_worktrees: bool
     stage_timeout_seconds: Optional[int]
     stage_environment: Dict[str, str]
+    deploy_policy: str = "all"
+    deploy_tag: Optional[str] = None
 
     @classmethod
     def from_env(
@@ -311,24 +400,40 @@ class OrchestratorConfig:
             environ.get("ORCHESTRATOR_WORKTREE_ROOT")
             or repo_root.parent / f".{repo_root.name}-orchestrator-worktrees"
         ).expanduser()
+        context_path = Path(environ.get("ORCHESTRATOR_CONTEXT_PATH") or repo_root / "context.md").expanduser()
         artifact_root = Path(
             environ.get("ORCHESTRATOR_ARTIFACT_ROOT") or repo_root / ".orchestrator" / "artifacts"
         ).expanduser()
         if not worktree_root.is_absolute():
             worktree_root = (repo_root / worktree_root).resolve()
+        if not context_path.is_absolute():
+            context_path = (repo_root / context_path).resolve()
         if not artifact_root.is_absolute():
             artifact_root = (repo_root / artifact_root).resolve()
 
+        context_update_command = blank_to_none(
+            first_env(environ, ["ORCHESTRATOR_CONTEXT_UPDATER_AGENT_COMMAND", "ORCHESTRATOR_CONTEXT_UPDATE_COMMAND"])
+        )
+        planner_command = blank_to_none(
+            first_env(environ, ["ORCHESTRATOR_PLANNER_AGENT_COMMAND", "ORCHESTRATOR_PLANNER_COMMAND"])
+        )
+        planner_tag = blank_to_none(environ.get("ORCHESTRATOR_PLANNER_TAG") or "plan")
         deploy_command = blank_to_none(
             first_env(environ, ["ORCHESTRATOR_DEPLOYER_AGENT_COMMAND", "ORCHESTRATOR_DEPLOY_COMMAND"])
         )
         smoke_command = blank_to_none(environ.get("ORCHESTRATOR_SMOKE_COMMAND"))
-        deploy_enabled = truthy(environ.get("ORCHESTRATOR_DEPLOY_ENABLED"))
-        if environ.get("ORCHESTRATOR_DEPLOY_ENABLED") is None:
-            deploy_enabled = bool(deploy_command or smoke_command)
+        deploy_policy = normalize_deploy_policy(
+            environ.get("ORCHESTRATOR_DEPLOY_POLICY"),
+            deploy_enabled_value=environ.get("ORCHESTRATOR_DEPLOY_ENABLED"),
+            has_deploy_command=bool(deploy_command or smoke_command),
+        )
+        deploy_tag = blank_to_none(environ.get("ORCHESTRATOR_DEPLOY_TAG"))
+        deploy_enabled = deploy_policy != "none"
+        if deploy_policy == "tagged" and not deploy_tag:
+            raise ConfigError("ORCHESTRATOR_DEPLOY_POLICY=tagged requires ORCHESTRATOR_DEPLOY_TAG")
         if deploy_enabled and not (deploy_command or smoke_command):
             raise ConfigError(
-                "ORCHESTRATOR_DEPLOY_ENABLED is true but neither "
+                "Deployment is enabled but neither "
                 "ORCHESTRATOR_DEPLOY_COMMAND nor ORCHESTRATOR_SMOKE_COMMAND is set"
             )
 
@@ -341,10 +446,14 @@ class OrchestratorConfig:
             dry_run=dry_run_override or truthy(environ.get("ORCHESTRATOR_DRY_RUN")),
             base_branch=environ.get("ORCHESTRATOR_BASE_BRANCH") or discover_base_branch(repo_root),
             repo_root=repo_root,
+            context_path=context_path.resolve(),
             worktree_root=worktree_root.resolve(),
             artifact_root=artifact_root.resolve(),
             builder_command=builder_command,
             verifier_command=verifier_command,
+            context_update_command=context_update_command,
+            planner_command=planner_command,
+            planner_tag=planner_tag,
             deploy_command=deploy_command,
             smoke_command=smoke_command,
             deploy_enabled=deploy_enabled,
@@ -352,6 +461,8 @@ class OrchestratorConfig:
             keep_worktrees=truthy(environ.get("ORCHESTRATOR_KEEP_WORKTREES")),
             stage_timeout_seconds=stage_timeout,
             stage_environment=stage_environment_from_env(environ),
+            deploy_policy=deploy_policy,
+            deploy_tag=deploy_tag,
         )
 
     def deploy_stage_command(self) -> Optional[str]:
@@ -366,9 +477,38 @@ class OrchestratorConfig:
         payload = dataclasses.asdict(self)
         payload["provider_options"] = redact_secrets(self.provider_options)
         payload["stage_environment"] = redact_secrets(self.stage_environment)
-        for key in ("repo_root", "worktree_root", "artifact_root"):
+        for key in ("repo_root", "context_path", "worktree_root", "artifact_root"):
             payload[key] = str(payload[key])
         return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class AttemptResetConfig:
+    repo_root: Path
+    worktree_root: Path
+    artifact_root: Path
+
+
+def attempt_reset_config_from_env(environ: Mapping[str, str], *, cwd: Path) -> AttemptResetConfig:
+    repo_root = discover_repo_root(cwd)
+    worktree_root = Path(
+        environ.get("ORCHESTRATOR_WORKTREE_ROOT")
+        or repo_root.parent / f".{repo_root.name}-orchestrator-worktrees"
+    ).expanduser()
+    artifact_root = Path(
+        environ.get("ORCHESTRATOR_ARTIFACT_ROOT") or repo_root / ".orchestrator" / "artifacts"
+    ).expanduser()
+
+    if not worktree_root.is_absolute():
+        worktree_root = (repo_root / worktree_root).resolve()
+    if not artifact_root.is_absolute():
+        artifact_root = (repo_root / artifact_root).resolve()
+
+    return AttemptResetConfig(
+        repo_root=repo_root,
+        worktree_root=worktree_root.resolve(),
+        artifact_root=artifact_root.resolve(),
+    )
 
 
 def parse_nonnegative_int(value: Optional[str], *, default: int) -> int:
@@ -381,6 +521,49 @@ def parse_nonnegative_int(value: Optional[str], *, default: int) -> int:
     if parsed < 0:
         raise ConfigError(f"Expected a non-negative integer, got: {value}")
     return parsed
+
+
+def normalize_deploy_policy(
+    value: Optional[str],
+    *,
+    deploy_enabled_value: Optional[str],
+    has_deploy_command: bool,
+) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        if deploy_enabled_value is not None:
+            if falsey(deploy_enabled_value):
+                return "none"
+            if truthy(deploy_enabled_value):
+                return "all"
+            raise ConfigError(
+                "ORCHESTRATOR_DEPLOY_ENABLED must be true/false when ORCHESTRATOR_DEPLOY_POLICY is not set"
+            )
+        return "all" if has_deploy_command else "none"
+
+    aliases = {
+        "all": "all",
+        "always": "all",
+        "every": "all",
+        "every-task": "all",
+        "every_task": "all",
+        "tag": "tagged",
+        "tags": "tagged",
+        "tagged": "tagged",
+        "tagged-only": "tagged",
+        "tagged_only": "tagged",
+        "none": "none",
+        "never": "none",
+        "off": "none",
+        "false": "none",
+        "disabled": "none",
+        "disable": "none",
+    }
+    if raw not in aliases:
+        raise ConfigError(
+            "ORCHESTRATOR_DEPLOY_POLICY must be one of: all, tagged, none"
+        )
+    return aliases[raw]
 
 
 def parse_optional_positive_int(value: Optional[str]) -> Optional[int]:
@@ -530,6 +713,10 @@ def validate_runtime_config(config: "OrchestratorConfig") -> None:
         ("builder", config.builder_command),
         ("verifier", config.verifier_command),
     ]
+    if config.context_update_command:
+        checks.append(("context", config.context_update_command))
+    if config.planner_command:
+        checks.append(("planner", config.planner_command))
     if config.deploy_enabled:
         checks.extend(
             [
@@ -539,6 +726,14 @@ def validate_runtime_config(config: "OrchestratorConfig") -> None:
         )
 
     errors: List[str] = []
+    if config.context_update_command or config.planner_command:
+        try:
+            ensure_under(config.context_path, config.repo_root)
+        except ConfigError as exc:
+            errors.append(str(exc))
+        if not config.context_path.exists():
+            errors.append(f"Missing shared context file: {config.context_path}")
+
     for stage, command in checks:
         if not command:
             continue
@@ -712,7 +907,7 @@ def provider_options_from_env(provider_name: str, environ: Mapping[str, str]) ->
             options["MONDAY_API_VERSION"] = environ["MONDAY_API_VERSION"]
         return options
     if provider_name == "command":
-        return required_env(
+        options = required_env(
             environ,
             [
                 "ORCHESTRATOR_COMMAND_NEXT_TASK",
@@ -721,6 +916,9 @@ def provider_options_from_env(provider_name: str, environ: Mapping[str, str]) ->
                 "ORCHESTRATOR_COMMAND_COMMENT_TASK",
             ],
         )
+        if environ.get("ORCHESTRATOR_COMMAND_CREATE_TASK"):
+            options["ORCHESTRATOR_COMMAND_CREATE_TASK"] = environ["ORCHESTRATOR_COMMAND_CREATE_TASK"]
+        return options
     raise ConfigError(
         f"Unsupported ORCHESTRATOR_PROVIDER '{provider_name}'. "
         "Supported providers: asana, trello, clickup, jira, monday, command."
@@ -790,10 +988,18 @@ def configuration_help(provider_name: str, error: Exception) -> str:
 
 
 class AsanaClient:
-    def __init__(self, token: str, *, dry_run: bool = False, api_base: str = ASANA_API_BASE) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        dry_run: bool = False,
+        api_base: str = ASANA_API_BASE,
+        project_gid: str = "",
+    ) -> None:
         self.token = token
         self.dry_run = dry_run
         self.api_base = api_base.rstrip("/")
+        self.project_gid = project_gid
 
     def get_next_ready_task(self, section_gid: str) -> Optional[Dict[str, Any]]:
         response = self._request(
@@ -856,6 +1062,44 @@ class AsanaClient:
             f"/tasks/{task_gid}/stories",
             data={"text": text},
             mutation=True,
+        )
+
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        if not self.project_gid:
+            raise ProviderError("Asana task creation requires ASANA_PROJECT_GID or ORCHESTRATOR_PROJECT_ID")
+        data: Dict[str, Any] = {
+            "name": title,
+            "notes": description,
+            "projects": [self.project_gid],
+        }
+        if parent_task_id:
+            data["parent"] = parent_task_id
+        if self.dry_run:
+            print(f"[dry-run] Asana create task in project {self.project_gid}: {title}")
+            return normalized_task(provider="asana", task_id=f"dry-run-{slug(title)}", name=title, notes=description)
+        response = self._request("POST", "/tasks", data=data, mutation=True)
+        task = response.get("data") or {}
+        task_id = str(task.get("gid") or task.get("id") or "")
+        if not task_id:
+            raise ProviderError("Asana create task response did not include a task gid")
+        self.move_task(task_id, ready_state)
+        if tags:
+            self.comment(task_id, "Tags requested by planner: " + ", ".join(tags))
+        return normalized_task(
+            provider="asana",
+            task_id=task_id,
+            name=task.get("name") or title,
+            notes=description,
+            url=task.get("permalink_url") or "",
+            raw=task,
         )
 
     def _request(
@@ -1054,6 +1298,37 @@ class TrelloProvider:
             params=self._params({"text": text}),
         )
 
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        desc = description
+        if tags:
+            desc += "\n\nTags: " + ", ".join(tags)
+        if parent_task_id:
+            desc += f"\n\nPlanned from: {parent_task_id}"
+        if self.dry_run:
+            print(f"[dry-run] Trello create card in list {ready_state}: {title}")
+            return normalized_task(provider="trello", task_id=f"dry-run-{slug(title)}", name=title, notes=desc)
+        card = self.http.request(
+            "POST",
+            f"{TRELLO_API_BASE}/cards",
+            params=self._params({"idList": ready_state, "name": title, "desc": desc}),
+        )
+        return normalized_task(
+            provider="trello",
+            task_id=card["id"],
+            name=card.get("name") or title,
+            notes=card.get("desc") or desc,
+            url=card.get("url") or "",
+            raw=card,
+        )
+
 
 class ClickUpProvider:
     def __init__(
@@ -1172,6 +1447,35 @@ class ClickUpProvider:
             headers=self.headers,
             json_body={"comment_text": text},
         )
+
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "name": title,
+            "description": description,
+            "status": self._status_api_value(ready_state) or ready_state,
+        }
+        if tags:
+            body["tags"] = list(tags)
+        if parent_task_id:
+            body["parent"] = parent_task_id
+        if self.dry_run:
+            print(f"[dry-run] ClickUp create task in list {self.list_id}: {title}")
+            return normalized_task(provider="clickup", task_id=f"dry-run-{slug(title)}", name=title, notes=description)
+        task = self.http.request(
+            "POST",
+            f"{self.api_base}/list/{self.list_id}/task",
+            headers=self.headers,
+            json_body=body,
+        )
+        return self._normalize(task)
 
     def _status_api_value(self, configured_status: str) -> str:
         configured = configured_status.strip()
@@ -1299,6 +1603,44 @@ class JiraProvider:
             headers=self.headers,
             json_body={"body": jira_doc_text(text)},
         )
+
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        project_key = self.options.get("JIRA_PROJECT_KEY")
+        if not project_key:
+            raise ProviderError("Jira task creation requires JIRA_PROJECT_KEY")
+        fields: Dict[str, Any] = {
+            "project": {"key": project_key},
+            "summary": title,
+            "description": jira_doc_text(description),
+            "issuetype": {"name": self.options.get("JIRA_ISSUE_TYPE", "Task")},
+        }
+        if tags:
+            fields["labels"] = [slug(tag).lower() for tag in tags]
+        if self.dry_run:
+            print(f"[dry-run] Jira create issue in project {project_key}: {title}")
+            return normalized_task(provider="jira", task_id=f"dry-run-{slug(title)}", name=title, notes=description)
+        issue = self.http.request(
+            "POST",
+            f"{self.api_base}/issue",
+            headers=self.headers,
+            json_body={"fields": fields},
+        )
+        issue_id = str(issue.get("key") or issue.get("id") or "")
+        if not issue_id:
+            raise ProviderError("Jira create issue response did not include an issue key")
+        try:
+            self.move_task(issue_id, ready_state)
+        except ProviderError:
+            pass
+        return self.get_task_contract(issue_id)
 
     def _transition_id(self, task_gid: str, target: str) -> str:
         response = self.http.request(
@@ -1457,6 +1799,50 @@ mutation ($item_id: ID!, $body: String!) {
             {"item_id": task_gid, "body": text},
         )
 
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        notes = description
+        if tags:
+            notes += "\n\nTags: " + ", ".join(tags)
+        if parent_task_id:
+            notes += f"\n\nPlanned from: {parent_task_id}"
+        column_values = {self.status_column_id: {"label": ready_state}}
+        if self.dry_run:
+            print(f"[dry-run] monday.com create item on board {self.board_id}: {title}")
+            return normalized_task(provider="monday", task_id=f"dry-run-{slug(title)}", name=title, notes=notes)
+        data = self.graphql(
+            """
+mutation ($board_id: ID!, $item_name: String!, $column_values: JSON!) {
+  create_item(board_id: $board_id, item_name: $item_name, column_values: $column_values) { id name url }
+}
+""",
+            {
+                "board_id": self.board_id,
+                "item_name": title,
+                "column_values": json.dumps(column_values),
+            },
+        )
+        item = data.get("create_item") or {}
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            raise ProviderError("monday.com create item response did not include an item id")
+        self.comment(item_id, notes)
+        return normalized_task(
+            provider="monday",
+            task_id=item_id,
+            name=item.get("name") or title,
+            notes=notes,
+            url=item.get("url") or "",
+            raw=item,
+        )
+
     @staticmethod
     def _normalize(item: Mapping[str, Any]) -> Dict[str, Any]:
         notes = "\n".join(
@@ -1517,6 +1903,44 @@ class CommandProvider:
             self.options["ORCHESTRATOR_COMMAND_COMMENT_TASK"],
             {"ORCHESTRATOR_TASK_ID": task_gid, "ORCHESTRATOR_COMMENT_TEXT": text},
         )
+
+    def create_task(
+        self,
+        *,
+        title: str,
+        description: str,
+        ready_state: str,
+        tags: Sequence[str] = (),
+        parent_task_id: str = "",
+    ) -> Dict[str, Any]:
+        command = self.options.get("ORCHESTRATOR_COMMAND_CREATE_TASK")
+        if not command:
+            raise ProviderError("Command provider task creation requires ORCHESTRATOR_COMMAND_CREATE_TASK")
+        payload = {
+            "title": title,
+            "description": description,
+            "ready_state": ready_state,
+            "tags": list(tags),
+            "parent_task_id": parent_task_id,
+        }
+        if self.dry_run:
+            print(f"[dry-run] command provider create task: {title}")
+            return normalized_task(provider="command", task_id=f"dry-run-{slug(title)}", name=title, notes=description)
+        created = self._run_json(
+            command,
+            {
+                "ORCHESTRATOR_TASK_CREATE_JSON": json.dumps(payload),
+                "ORCHESTRATOR_TASK_TITLE": title,
+                "ORCHESTRATOR_TASK_DESCRIPTION": description,
+                "ORCHESTRATOR_TASK_TAGS": ",".join(tags),
+                "ORCHESTRATOR_TASK_PARENT_ID": parent_task_id,
+                "ORCHESTRATOR_STATE": "ready",
+                "ORCHESTRATOR_STATE_VALUE": ready_state,
+            },
+        )
+        if not created:
+            raise ProviderError("Command provider create task command returned no task payload")
+        return self._normalize_payload(created)
 
     def _run_json(
         self,
@@ -1589,6 +2013,7 @@ def build_provider(config: OrchestratorConfig) -> Any:
         return AsanaClient(
             config.provider_options["ASANA_ACCESS_TOKEN"],
             dry_run=config.dry_run,
+            project_gid=config.project_gid,
         )
     if config.provider_name == "trello":
         return TrelloProvider(
@@ -1656,6 +2081,458 @@ class StateStore:
         state.pop("active_attempt", None)
         state["updated_at"] = utc_now()
         atomic_write_json(self.path, state)
+
+
+def _read_reset_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return read_json(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Warning: could not read attempt state {path}: {exc}; replacing it.")
+        return {}
+
+
+def _clear_attempt_state(path: Path, *, dry_run: bool) -> bool:
+    if not path.exists():
+        print(f"No attempt state file found at {path}")
+        return False
+    if dry_run:
+        print(f"Would clear active attempt state in {path}")
+        return True
+
+    state = _read_reset_state(path)
+    state.pop("active_attempt", None)
+    state["updated_at"] = utc_now()
+    atomic_write_json(path, state)
+    print(f"Cleared active attempt state in {path}")
+    return True
+
+
+def _git_attempt_worktrees(config: AttemptResetConfig) -> List[Path]:
+    completed = run_local(["git", "worktree", "list", "--porcelain"], cwd=config.repo_root, check=False)
+    if completed.returncode != 0:
+        return []
+
+    paths: List[Path] = []
+    for line in completed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line[len("worktree ") :].strip()).resolve()
+        if "-attempt-" not in path.name:
+            continue
+        try:
+            ensure_under(path, config.worktree_root)
+        except ConfigError:
+            continue
+        paths.append(path)
+    return sorted(set(paths), key=str)
+
+
+def _attempt_branches(repo_root: Path) -> List[str]:
+    completed = run_local(
+        ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/orchestrator"],
+        cwd=repo_root,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    return sorted(line.strip() for line in completed.stdout.splitlines() if "-attempt-" in line)
+
+
+def _remove_tree(path: Path, root: Path, *, label: str, dry_run: bool) -> bool:
+    ensure_under(path, root)
+    if dry_run:
+        print(f"Would remove {label} {path}")
+        return True
+
+    print(f"Removing {label} {path}")
+    error = rmtree_with_retries(path)
+    if error and path.exists():
+        print(f"Warning: could not remove {label} {path}: {error}")
+        return False
+    return True
+
+
+def _stale_attempt_worktree_dirs(worktree_root: Path) -> List[Path]:
+    if not worktree_root.exists():
+        return []
+    return sorted(
+        (path.resolve() for path in worktree_root.iterdir() if path.is_dir() and "-attempt-" in path.name),
+        key=str,
+    )
+
+
+def _attempt_artifact_dirs(artifact_root: Path) -> List[Path]:
+    if not artifact_root.exists():
+        return []
+    return sorted(
+        (path.resolve() for path in artifact_root.rglob("attempt-*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+
+
+def _remove_empty_artifact_dirs(artifact_root: Path) -> None:
+    if not artifact_root.exists():
+        return
+    dirs = sorted(
+        (path for path in artifact_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for path in dirs:
+        try:
+            ensure_under(path, artifact_root)
+            path.rmdir()
+        except (ConfigError, OSError):
+            pass
+
+
+def reset_attempts(config: AttemptResetConfig, *, dry_run: bool = False) -> Dict[str, int]:
+    counts = {
+        "state_files": 0,
+        "worktrees": 0,
+        "stale_worktree_dirs": 0,
+        "branches": 0,
+        "artifact_dirs": 0,
+        "failures": 0,
+    }
+    action = "Planning reset of" if dry_run else "Resetting"
+    print(f"{action} local workflow attempts for {config.repo_root}")
+
+    state_path = config.artifact_root / "orchestrator_state.json"
+    if _clear_attempt_state(state_path, dry_run=dry_run):
+        counts["state_files"] += 1
+
+    for path in _git_attempt_worktrees(config):
+        if dry_run:
+            print(f"Would remove git worktree {path}")
+            counts["worktrees"] += 1
+            continue
+        print(f"Removing git worktree {path}")
+        run_local(["git", "worktree", "remove", "--force", str(path)], cwd=config.repo_root, check=False)
+        if path.exists() and not _remove_tree(path, config.worktree_root, label="worktree directory", dry_run=False):
+            counts["failures"] += 1
+        else:
+            counts["worktrees"] += 1
+
+    if not dry_run:
+        run_local(["git", "worktree", "prune"], cwd=config.repo_root, check=False)
+
+    for path in _stale_attempt_worktree_dirs(config.worktree_root):
+        if _remove_tree(path, config.worktree_root, label="stale worktree directory", dry_run=dry_run):
+            counts["stale_worktree_dirs"] += 1
+        else:
+            counts["failures"] += 1
+
+    if not dry_run:
+        run_local(["git", "worktree", "prune"], cwd=config.repo_root, check=False)
+
+    for branch in _attempt_branches(config.repo_root):
+        if dry_run:
+            print(f"Would delete branch {branch}")
+            counts["branches"] += 1
+            continue
+        print(f"Deleting branch {branch}")
+        completed = run_local(["git", "branch", "-D", branch], cwd=config.repo_root, check=False)
+        if completed.returncode == 0:
+            counts["branches"] += 1
+        elif completed.stdout.strip():
+            print(f"Warning: could not delete branch {branch}: {completed.stdout.strip()}")
+            counts["failures"] += 1
+
+    for path in _attempt_artifact_dirs(config.artifact_root):
+        if path.exists() and _remove_tree(path, config.artifact_root, label="attempt artifacts", dry_run=dry_run):
+            counts["artifact_dirs"] += 1
+        elif path.exists():
+            counts["failures"] += 1
+
+    if not dry_run:
+        _remove_empty_artifact_dirs(config.artifact_root)
+
+    status = "complete" if counts["failures"] == 0 else "incomplete"
+    print(
+        f"Attempt reset {status}: "
+        f"{counts['state_files']} state file(s), "
+        f"{counts['worktrees']} git worktree(s), "
+        f"{counts['stale_worktree_dirs']} stale worktree dir(s), "
+        f"{counts['branches']} branch(es), "
+        f"{counts['artifact_dirs']} artifact dir(s), "
+        f"{counts['failures']} failure(s)."
+    )
+    return counts
+
+
+def _normalized_tag(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def task_tag_values(task_contract: Mapping[str, Any]) -> List[str]:
+    values: List[str] = []
+
+    def collect(candidate: Any) -> None:
+        if isinstance(candidate, str):
+            if candidate.strip():
+                values.append(candidate.strip())
+            return
+        if isinstance(candidate, Mapping):
+            for key in ("name", "tag", "id", "gid"):
+                value = candidate.get(key)
+                if value is not None and str(value).strip():
+                    values.append(str(value).strip())
+            return
+        if isinstance(candidate, IterableABC) and not isinstance(candidate, (str, bytes)):
+            for item in candidate:
+                collect(item)
+
+    collect(task_contract.get("tags"))
+    raw = task_contract.get("raw")
+    if isinstance(raw, Mapping):
+        collect(raw.get("tags"))
+        collect(raw.get("labels"))
+    return values
+
+
+def task_has_deploy_tag(task_contract: Mapping[str, Any], deploy_tag: Optional[str]) -> bool:
+    expected = _normalized_tag(deploy_tag)
+    if not expected:
+        return False
+    return any(_normalized_tag(value) == expected for value in task_tag_values(task_contract))
+
+
+def task_text(task_contract: Mapping[str, Any]) -> str:
+    parts = [
+        str(task_contract.get("name") or ""),
+        str(task_contract.get("notes") or ""),
+        str(task_contract.get("description") or ""),
+        str(task_contract.get("text_content") or ""),
+    ]
+    raw = task_contract.get("raw")
+    if isinstance(raw, Mapping):
+        parts.extend(
+            [
+                str(raw.get("name") or ""),
+                str(raw.get("description") or ""),
+                str(raw.get("text_content") or ""),
+            ]
+        )
+    return "\n".join(part for part in parts if part)
+
+
+def task_has_planner_signal(task_contract: Mapping[str, Any], planner_tag: Optional[str]) -> bool:
+    expected = _normalized_tag(planner_tag)
+    if expected and any(_normalized_tag(value) == expected for value in task_tag_values(task_contract)):
+        return True
+    return bool(PLANNING_TASK_PATTERN.search(task_text(task_contract)))
+
+
+def normalize_plan_tags(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in re.split(r"[,\n]+", value) if part.strip()]
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return []
+
+
+def plan_task_description(item: Mapping[str, Any], *, source_task: Mapping[str, Any]) -> str:
+    description = str(item.get("description") or item.get("notes") or "").strip()
+    acceptance = item.get("acceptance_criteria") or item.get("acceptance") or []
+    if isinstance(acceptance, str):
+        acceptance_items = [line.strip("- ").strip() for line in acceptance.splitlines() if line.strip()]
+    elif isinstance(acceptance, Sequence) and not isinstance(acceptance, (str, bytes, bytearray)):
+        acceptance_items = [str(line).strip() for line in acceptance if str(line).strip()]
+    else:
+        acceptance_items = []
+
+    parts = [description]
+    if acceptance_items:
+        parts.append("Acceptance criteria:\n" + "\n".join(f"- {line}" for line in acceptance_items))
+    source_url = str(source_task.get("permalink_url") or source_task.get("url") or "").strip()
+    source_name = str(source_task.get("name") or source_task.get("gid") or "").strip()
+    source_line = f"Planned from: {source_name}"
+    if source_url:
+        source_line += f" ({source_url})"
+    parts.append(source_line)
+    return "\n\n".join(part for part in parts if part)
+
+
+def load_task_plan(outcome: "StageOutcome", plan_path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+    payload: Any
+    if plan_path.exists():
+        try:
+            payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            return [], [f"invalid task plan JSON at {plan_path}: {exc}"]
+    else:
+        payload = outcome.report.get("task_plan") or outcome.report.get("tasks")
+
+    raw_tasks = payload.get("tasks") if isinstance(payload, Mapping) else payload
+    if not isinstance(raw_tasks, list):
+        return [], ["task plan must be a JSON object with a tasks array or a tasks array"]
+
+    tasks: List[Dict[str, Any]] = []
+    failures: List[str] = []
+    for index, raw_item in enumerate(raw_tasks, start=1):
+        if not isinstance(raw_item, Mapping):
+            failures.append(f"task plan item {index} must be an object")
+            continue
+        title = str(raw_item.get("title") or raw_item.get("name") or raw_item.get("summary") or "").strip()
+        description = str(raw_item.get("description") or raw_item.get("notes") or "").strip()
+        if not title:
+            failures.append(f"task plan item {index} missing title")
+        if not description:
+            failures.append(f"task plan item {index} missing description")
+        if not title or not description:
+            continue
+        item = dict(raw_item)
+        item["title"] = title
+        item["description"] = description
+        item["tags"] = normalize_plan_tags(item.get("tags"))
+        tasks.append(item)
+    if not tasks and not failures:
+        failures.append("task plan did not include any tasks")
+    return tasks, failures
+
+
+def created_tasks_next_action(created_tasks: Sequence[Mapping[str, Any]]) -> str:
+    if not created_tasks:
+        return "New tasks are in the Ready queue."
+    labels: List[str] = []
+    for task in created_tasks[:8]:
+        title = str(task.get("title") or task.get("id") or "task")
+        url = str(task.get("url") or "").strip()
+        labels.append(f"{title} ({url})" if url else title)
+    suffix = "" if len(created_tasks) <= 8 else f"; plus {len(created_tasks) - 8} more"
+    return "Created Ready tasks: " + "; ".join(labels) + suffix + "."
+
+
+def _task_deploy_text(task_contract: Mapping[str, Any]) -> str:
+    parts = [
+        str(task_contract.get("name") or ""),
+        str(task_contract.get("notes") or ""),
+        str(task_contract.get("description") or ""),
+        str(task_contract.get("text_content") or ""),
+    ]
+    raw = task_contract.get("raw")
+    if isinstance(raw, Mapping):
+        parts.extend(
+            [
+                str(raw.get("name") or ""),
+                str(raw.get("description") or ""),
+                str(raw.get("text_content") or ""),
+            ]
+        )
+    return "\n".join(part for part in parts if part)
+
+
+def task_requests_deploy(task_contract: Mapping[str, Any]) -> Optional[bool]:
+    text = _task_deploy_text(task_contract)
+    if DEPLOY_SKIP_PATTERN.search(text):
+        return False
+    if DEPLOY_FORCE_PATTERN.search(text):
+        return True
+    return None
+
+
+def report_requests_deploy(report: Mapping[str, Any]) -> Optional[bool]:
+    for key in ("deploy_required", "requires_deploy"):
+        if key in report:
+            return bool(report[key])
+    for key in ("skip_deploy", "skip_deployment", "skip_smoke"):
+        if key in report and bool(report[key]):
+            return False
+    return None
+
+
+def report_changed_files(report: Mapping[str, Any]) -> List[str]:
+    changed = report.get("changed_files") or []
+    if isinstance(changed, Mapping):
+        changed = changed.values()
+    if not isinstance(changed, IterableABC) or isinstance(changed, (str, bytes)):
+        return []
+    return [str(path) for path in changed if str(path).strip()]
+
+
+def changed_files_since_base(worktree_path: Path, base_ref: str) -> List[str]:
+    if base_ref == "HEAD":
+        return []
+    completed = run_local(["git", "diff", "--name-only", f"{base_ref}...HEAD"], cwd=worktree_path, check=False)
+    if completed.returncode != 0:
+        completed = run_local(["git", "diff", "--name-only", base_ref, "HEAD"], cwd=worktree_path, check=False)
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def should_run_deploy(
+    task_contract: Mapping[str, Any],
+    build: "StageOutcome",
+    verify: "StageOutcome",
+    *,
+    worktree_path: Path,
+    base_ref: str,
+) -> Tuple[bool, str]:
+    for report in (verify.report, build.report):
+        report_decision = report_requests_deploy(report)
+        if report_decision is False:
+            return False, "stage report requested deploy/smoke skip"
+        if report_decision is True:
+            return True, "stage report requested deploy"
+
+    task_decision = task_requests_deploy(task_contract)
+    if task_decision is False:
+        return False, "task requested deploy/smoke skip"
+    if task_decision is True:
+        return True, "task requested deploy"
+
+    changed = report_changed_files(build.report) or changed_files_since_base(worktree_path, base_ref)
+    if not changed:
+        return False, "no changed files to deploy"
+    return True, "changed files require deploy"
+
+
+def read_stage_report(attempt_artifact_dir: Path, stage: str) -> Dict[str, Any]:
+    report_path = attempt_artifact_dir / stage / f"{stage}_report.json"
+    if not report_path.exists():
+        return {}
+    try:
+        return read_json(report_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def deployer_skip_reason(
+    task_contract: Mapping[str, Any],
+    attempt_artifact_dir: Path,
+    worktree_path: Path,
+    base_ref: str,
+    *,
+    deploy_policy: str = "all",
+    deploy_tag: Optional[str] = None,
+) -> Optional[str]:
+    if deploy_policy == "none":
+        return "deployment policy is none"
+    if deploy_policy == "tagged" and not task_has_deploy_tag(task_contract, deploy_tag):
+        return f"task does not have deployment tag '{deploy_tag}'"
+
+    task_decision = task_requests_deploy(task_contract)
+    if task_decision is False:
+        return "task requested deploy/smoke skip"
+    if task_decision is True:
+        return None
+
+    reports = [read_stage_report(attempt_artifact_dir, "verifier"), read_stage_report(attempt_artifact_dir, "builder")]
+    for report in reports:
+        report_decision = report_requests_deploy(report)
+        if report_decision is False:
+            return "stage report requested deploy/smoke skip"
+        if report_decision is True:
+            return None
+
+    return None
 
 
 class WorktreeManager:
@@ -1763,6 +2640,22 @@ class StageOutcome:
         return self.status == "blocked"
 
 
+def stage_report_summary(outcome: "StageOutcome") -> Dict[str, Any]:
+    report = outcome.report if isinstance(outcome.report, Mapping) else {}
+    return {
+        "stage": outcome.stage,
+        "status": outcome.status,
+        "summary": outcome.summary,
+        "changed_files": report.get("changed_files") or [],
+        "checks": report.get("checks") or [],
+        "failures": report.get("failures") or [],
+        "next_action": str(report.get("next_action", "")),
+        "artifact_paths": report.get("artifact_paths") or [],
+        "report_path": str(outcome.report_path),
+        "log_path": str(outcome.log_path),
+    }
+
+
 class StageRunner:
     def __init__(self, config: OrchestratorConfig) -> None:
         self.config = config
@@ -1776,15 +2669,53 @@ class StageRunner:
         attempt: int,
         worktree_path: Path,
         attempt_artifact_dir: Path,
+        extra_env: Optional[Mapping[str, str]] = None,
     ) -> StageOutcome:
         stage_dir = attempt_artifact_dir / stage
         stage_dir.mkdir(parents=True, exist_ok=True)
         report_path = stage_dir / f"{stage}_report.json"
         log_path = stage_dir / f"{stage}.log"
         contract_path = stage_dir / "task_contract.json"
+        task_plan_path = stage_dir / "task_plan.json"
         atomic_write_json(contract_path, task_contract)
 
         task_id = str(task_contract["gid"])
+        if stage == "deployer":
+            skip_reason = deployer_skip_reason(
+                task_contract,
+                attempt_artifact_dir,
+                worktree_path,
+                self.config.base_branch,
+                deploy_policy=self.config.deploy_policy,
+                deploy_tag=self.config.deploy_tag,
+            )
+            if skip_reason:
+                summary = f"Skipped deploy/smoke because {skip_reason}."
+                report = {
+                    "task_id": task_id,
+                    "status": "success",
+                    "summary": summary,
+                    "changed_files": [],
+                    "checks": [{"name": "deploy policy", "status": "skipped", "details": skip_reason}],
+                    "failures": [],
+                    "next_action": "Continue without deploy.",
+                    "artifact_paths": [str(log_path)],
+                    "deploy_skipped": True,
+                    "deploy_skip_reason": skip_reason,
+                }
+                log_path.write_text(summary + "\n", encoding="utf-8")
+                atomic_write_json(report_path, report)
+                return StageOutcome(
+                    stage=stage,
+                    status="success",
+                    summary=summary,
+                    report=report,
+                    report_path=report_path,
+                    log_path=log_path,
+                    retryable=False,
+                    exit_code=0,
+                )
+
         subagent_id = f"{slug(task_id)}-{attempt}-{slug(stage)}-{compact_timestamp()}"
         env = os.environ.copy()
         env.update(self.config.stage_environment)
@@ -1799,7 +2730,10 @@ class StageRunner:
                 "ASANA_TASK_CONTRACT_PATH": str(contract_path),
                 "ORCHESTRATOR_REPORT_PATH": str(report_path),
                 "ORCHESTRATOR_LOG_PATH": str(log_path),
+                "ORCHESTRATOR_TASK_PLAN_PATH": str(task_plan_path),
                 "ORCHESTRATOR_ARTIFACT_DIR": str(stage_dir),
+                "ORCHESTRATOR_ATTEMPT_ARTIFACT_DIR": str(attempt_artifact_dir),
+                "ORCHESTRATOR_CONTEXT_PATH": str(self.config.context_path),
                 "ORCHESTRATOR_ATTEMPT": str(attempt),
                 "ORCHESTRATOR_PROJECT_GID": self.config.project_gid,
                 "ORCHESTRATOR_PROJECT_ID": self.config.project_gid,
@@ -1808,6 +2742,8 @@ class StageRunner:
                 "ORCHESTRATOR_OBJECTIVE_VERIFIER": "true" if self.config.objective_verifier else "false",
             }
         )
+        if extra_env:
+            env.update(extra_env)
 
         started_at = time.monotonic()
         header = [
@@ -2001,7 +2937,7 @@ def failure_report(
         "next_action": next_action,
         "artifact_paths": list(artifact_paths),
         "retryable": retryable,
-        "generated_by": "asana_orchestrator",
+        "generated_by": "task_orchestrator",
         "generated_at": utc_now(),
     }
 
@@ -2283,6 +3219,35 @@ class TaskOrchestrator:
         state["updated_at"] = utc_now()
         atomic_write_json(self.state.path, state)
 
+    def _context_summary_payload(
+        self,
+        *,
+        task_contract: Mapping[str, Any],
+        attempt: int,
+        build: StageOutcome,
+        verify: StageOutcome,
+        deploy: Optional[StageOutcome],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "task_id": str(task_contract["gid"]),
+            "task_name": str(task_contract.get("name", "")),
+            "task_notes": str(task_contract.get("notes") or task_contract.get("description") or ""),
+            "task_url": str(task_contract.get("url") or task_contract.get("permalink_url") or ""),
+            "attempt": attempt,
+            "provider": self.config.provider_name,
+            "project_gid": self.config.project_gid,
+            "base_branch": self.config.base_branch,
+            "context_path": str(self.config.context_path),
+            "task_contract": dict(task_contract),
+            "stages": {
+                "builder": stage_report_summary(build),
+                "verifier": stage_report_summary(verify),
+            },
+        }
+        if deploy is not None:
+            payload["stages"]["deployer"] = stage_report_summary(deploy)
+        return payload
+
     def _run_attempt(
         self,
         task_contract: Mapping[str, Any],
@@ -2290,6 +3255,9 @@ class TaskOrchestrator:
         attempt_dir: Path,
         worktree_path: Path,
     ) -> StageOutcome:
+        if self._is_planning_task(task_contract):
+            return self._run_planning_attempt(task_contract, attempt, attempt_dir, worktree_path)
+
         task_id = str(task_contract["gid"])
         secondary_worktrees: List[Path] = []
         self._move(task_id, "building")
@@ -2359,6 +3327,7 @@ class TaskOrchestrator:
                 return verify
 
             deploy_command = self.config.deploy_stage_command() if self.config.deploy_enabled else None
+            deploy: Optional[StageOutcome] = None
             if deploy_command:
                 self._comment_outcome(task_id, verify, attempt, self.config.retry_limit + 1, terminal="handoff")
                 self._move(task_id, "deploying")
@@ -2383,20 +3352,220 @@ class TaskOrchestrator:
                 self.state.record_stage("deployer", deploy)
                 if not deploy.succeeded:
                     return deploy
-                self.worktrees.merge_into_base(self.worktrees.current_commit(worktree_path))
-                self._move(task_id, "done")
-                self._comment_outcome(task_id, deploy, attempt, self.config.retry_limit + 1, terminal="done")
-                deploy.status = "success"
-                return deploy
 
-            self.worktrees.merge_into_base(self.worktrees.current_commit(worktree_path))
+            final_outcome = deploy or verify
+            final_worktree = worktree_path
+            if self.config.context_update_command:
+                if deploy is not None:
+                    self._comment_outcome(task_id, deploy, attempt, self.config.retry_limit + 1, terminal="handoff")
+                else:
+                    self._comment_outcome(task_id, verify, attempt, self.config.retry_limit + 1, terminal="handoff")
+
+                context_worktree, _ = self.worktrees.create(
+                    task_id,
+                    attempt,
+                    stage="context",
+                    base_ref=verified_ref,
+                )
+                secondary_worktrees.append(context_worktree)
+                self._append_active_worktree(context_worktree)
+
+                context_summary_path = attempt_dir / "context" / "task_summary.json"
+                context_summary_path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(
+                    context_summary_path,
+                    self._context_summary_payload(
+                        task_contract=task_contract,
+                        attempt=attempt,
+                        build=build,
+                        verify=verify,
+                        deploy=deploy,
+                    ),
+                )
+                context = self.runner.run(
+                    stage="context",
+                    command=self.config.context_update_command,
+                    task_contract=task_contract,
+                    attempt=attempt,
+                    worktree_path=context_worktree,
+                    attempt_artifact_dir=attempt_dir,
+                    extra_env={
+                        "ORCHESTRATOR_TASK_SUMMARY_PATH": str(context_summary_path),
+                    },
+                )
+                self.state.record_stage("context", context)
+                if not context.succeeded:
+                    return context
+
+                expected_context_file = self.config.context_path.relative_to(self.config.repo_root).as_posix()
+                context_mutations = [Path(path).as_posix() for path in tracked_changed_files(context_worktree)]
+                unexpected_context_changes = [path for path in context_mutations if path != expected_context_file]
+                if not context_mutations or unexpected_context_changes:
+                    context = synthetic_stage_outcome(
+                        stage="context",
+                        task_id=task_id,
+                        attempt=attempt,
+                        attempt_artifact_dir=attempt_dir,
+                        summary="Context updater did not only update the shared context file",
+                        failures=(
+                            [f"expected context file change: {expected_context_file}"]
+                            if not context_mutations
+                            else [f"unexpected tracked file changed: {path}" for path in unexpected_context_changes]
+                        ),
+                        next_action="Update the context updater command so it only edits the shared context file.",
+                    )
+                    self.state.record_stage("context", context)
+                    return context
+
+                try:
+                    self.worktrees.checkpoint(context_worktree, task_id=task_id, attempt=attempt, stage="context")
+                except CommandError as exc:
+                    return synthetic_stage_outcome(
+                        stage="context",
+                        task_id=task_id,
+                        attempt=attempt,
+                        attempt_artifact_dir=attempt_dir,
+                        summary="Context changes could not be checkpointed for merge",
+                        failures=[str(exc)],
+                        next_action="Fix the context updater worktree state so it can be committed before merge.",
+                    )
+
+                final_outcome = context
+                final_worktree = context_worktree
+
+            try:
+                self.worktrees.merge_into_base(self.worktrees.current_commit(final_worktree))
+            except CommandError as exc:
+                return synthetic_stage_outcome(
+                    stage="orchestrator",
+                    task_id=task_id,
+                    attempt=attempt,
+                    attempt_artifact_dir=attempt_dir,
+                    summary="Task changes could not be merged back into the base branch",
+                    failures=[str(exc)],
+                    next_action="Fix the base branch or rerun the orchestrator from a named base branch.",
+                )
             self._move(task_id, "done")
-            self._comment_outcome(task_id, verify, attempt, self.config.retry_limit + 1, terminal="done")
-            verify.status = "success"
-            return verify
+            self._comment_outcome(task_id, final_outcome, attempt, self.config.retry_limit + 1, terminal="done")
+            final_outcome.status = "success"
+            return final_outcome
         finally:
             for secondary_worktree in reversed(secondary_worktrees):
                 self.worktrees.remove(secondary_worktree)
+
+    def _is_planning_task(self, task_contract: Mapping[str, Any]) -> bool:
+        return bool(
+            self.config.planner_command
+            and task_has_planner_signal(task_contract, self.config.planner_tag)
+        )
+
+    def _run_planning_attempt(
+        self,
+        task_contract: Mapping[str, Any],
+        attempt: int,
+        attempt_dir: Path,
+        worktree_path: Path,
+    ) -> StageOutcome:
+        task_id = str(task_contract["gid"])
+        if not self.config.planner_command:
+            return synthetic_stage_outcome(
+                stage="planner",
+                task_id=task_id,
+                attempt=attempt,
+                attempt_artifact_dir=attempt_dir,
+                summary="Planning task cannot run because no planner command is configured",
+                failures=["ORCHESTRATOR_PLANNER_AGENT_COMMAND is not set"],
+                next_action="Configure a planner command or remove the planner signal from this task.",
+            )
+
+        self._move(task_id, "building")
+        plan_path = attempt_dir / "planner" / "task_plan.json"
+        planner = self.runner.run(
+            stage="planner",
+            command=self.config.planner_command,
+            task_contract=task_contract,
+            attempt=attempt,
+            worktree_path=worktree_path,
+            attempt_artifact_dir=attempt_dir,
+            extra_env={"ORCHESTRATOR_TASK_PLAN_PATH": str(plan_path)},
+        )
+        self.state.record_stage("planner", planner)
+        if not planner.succeeded:
+            return planner
+
+        planned_tasks, plan_failures = load_task_plan(planner, plan_path)
+        if plan_failures:
+            planner = synthetic_stage_outcome(
+                stage="planner",
+                task_id=task_id,
+                attempt=attempt,
+                attempt_artifact_dir=attempt_dir,
+                summary="Planner did not produce a valid task plan",
+                failures=plan_failures,
+                next_action="Fix the planner output so it contains a tasks array with title and description.",
+            )
+            self.state.record_stage("planner", planner)
+            return planner
+
+        created, creation_failures = self._create_planned_tasks(task_contract, planned_tasks)
+        if creation_failures:
+            planner = synthetic_stage_outcome(
+                stage="planner",
+                task_id=task_id,
+                attempt=attempt,
+                attempt_artifact_dir=attempt_dir,
+                summary="Planner task creation failed",
+                failures=creation_failures,
+                next_action="Inspect provider task creation permissions and rerun the planner task.",
+                retryable=True,
+            )
+            self.state.record_stage("planner", planner)
+            return planner
+
+        planner.report["created_tasks"] = created
+        planner.report["summary"] = f"Planner created {len(created)} task(s)."
+        planner.report["next_action"] = created_tasks_next_action(created)
+        planner.summary = str(planner.report["summary"])
+        atomic_write_json(planner.report_path, planner.report)
+        self._move(task_id, "done")
+        self._comment_outcome(task_id, planner, attempt, self.config.retry_limit + 1, terminal="done")
+        return planner
+
+    def _create_planned_tasks(
+        self,
+        source_task: Mapping[str, Any],
+        planned_tasks: Sequence[Mapping[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        create_task = getattr(self.provider, "create_task", None)
+        if not callable(create_task):
+            return [], [f"{self.config.provider_name} provider does not support task creation"]
+
+        created: List[Dict[str, Any]] = []
+        failures: List[str] = []
+        for index, item in enumerate(planned_tasks, start=1):
+            title = str(item["title"])
+            description = plan_task_description(item, source_task=source_task)
+            tags = normalize_plan_tags(item.get("tags"))
+            try:
+                task = create_task(
+                    title=title,
+                    description=description,
+                    ready_state=self.config.sections["ready"],
+                    tags=tags,
+                    parent_task_id=str(source_task.get("gid") or ""),
+                )
+            except ProviderError as exc:
+                failures.append(f"task {index} ({title}) could not be created: {exc}")
+                continue
+            created.append(
+                {
+                    "id": str(task.get("gid") or task.get("id") or ""),
+                    "title": str(task.get("name") or title),
+                    "url": str(task.get("permalink_url") or task.get("url") or ""),
+                    "tags": tags,
+                }
+            )
+        return created, failures
 
     def _attempt_artifact_dir(self, task_id: str, attempt: int) -> Path:
         safe_task = slug(task_id)
@@ -2479,9 +3648,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Task provider override. Defaults to ORCHESTRATOR_PROVIDER or asana.",
     )
     parser.add_argument("--once", action="store_true", help="Process at most one task, then exit.")
-    parser.add_argument("--dry-run", action="store_true", help="Skip provider mutations but still run local stages.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip provider mutations but still run local stages. With --reset-attempts, print cleanup actions only.",
+    )
     parser.add_argument("--validate-config", action="store_true", help="Validate configuration and exit.")
     parser.add_argument("--print-config", action="store_true", help="Print redacted resolved configuration.")
+    parser.add_argument(
+        "--reset-attempts",
+        action="store_true",
+        help="Clear local attempt state, attempt artifacts, attempt worktrees, and temporary attempt branches, then exit.",
+    )
     return parser
 
 
@@ -2494,6 +3672,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         load_env_file(args.env_file, environ)
     elif Path(".env").exists():
         load_env_file(Path(".env"), environ)
+
+    if args.reset_attempts:
+        config = attempt_reset_config_from_env(environ, cwd=Path.cwd())
+        counts = reset_attempts(config, dry_run=bool(args.dry_run))
+        return 1 if counts.get("failures") else 0
 
     provider_name = normalize_provider_name(args.provider or environ.get("ORCHESTRATOR_PROVIDER"))
     try:

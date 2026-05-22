@@ -1,5 +1,5 @@
 """Module entry point for PATBTAWO."""
 
-from scripts.asana_orchestrator import main
+from scripts.task_orchestrator import main
 
 __all__ = ["main"]
